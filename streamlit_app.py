@@ -288,42 +288,64 @@ def process_dkp(doc: Document, p: dict) -> Document:
         pv_text = (f"Первоначальный взнос по оплате цены Договора составляет "
                    f"{pv_str} руб ({pv_words}).")
         
-        # Ищем абзац про оплату (содержит "оплачивается", "3 дней", "кассу", "расчетный счет")
         inserted = False
         for para in doc.paragraphs:
             full_text = _para_text(para)
             if re.search(r"[Оо]плачивается.*[Пп]окупателем.*(?:дней|кассу|расчетный)", full_text):
-                # Вставляем новый параграф ПОСЛЕ этого
                 new_p = OxmlElement("w:p")
+                
+                # Копируем свойства параграфа (pPr)
+                pPr = para._element.find(qn("w:pPr"))
+                if pPr is not None:
+                    from copy import deepcopy
+                    new_pPr = deepcopy(pPr)
+                    new_p.append(new_pPr)
+                
                 new_r = OxmlElement("w:r")
+                
                 if para.runs:
                     rpr = para.runs[0]._r.find(qn("w:rPr"))
                     if rpr is not None:
                         from copy import deepcopy
-                        new_r.append(deepcopy(rpr))
+                        new_rPr = deepcopy(rpr)
+                        new_r.append(new_rPr)
+                
                 new_t = OxmlElement("w:t")
                 new_t.text = pv_text
+                new_t.set(qn("xml:space"), "preserve")
                 new_r.append(new_t)
                 new_p.append(new_r)
+                
                 para._element.addnext(new_p)
                 inserted = True
                 break
         
-        # Если не нашли абзац про оплату - вставляем после абзаца с ценой (как раньше)
         if not inserted:
             for para in doc.paragraphs:
                 if re.search(r"размере\s+" + _AMOUNT_PAT, _para_text(para)):
                     new_p = OxmlElement("w:p")
+                    
+                    pPr = para._element.find(qn("w:pPr"))
+                    if pPr is not None:
+                        from copy import deepcopy
+                        new_pPr = deepcopy(pPr)
+                        new_p.append(new_pPr)
+                    
                     new_r = OxmlElement("w:r")
+                    
                     if para.runs:
                         rpr = para.runs[0]._r.find(qn("w:rPr"))
                         if rpr is not None:
                             from copy import deepcopy
-                            new_r.append(deepcopy(rpr))
+                            new_rPr = deepcopy(rpr)
+                            new_r.append(new_rPr)
+                    
                     new_t = OxmlElement("w:t")
                     new_t.text = pv_text
+                    new_t.set(qn("xml:space"), "preserve")
                     new_r.append(new_t)
                     new_p.append(new_r)
+                    
                     para._element.addnext(new_p)
                     break
 
@@ -338,17 +360,23 @@ def process_pko(doc: Document, p: dict) -> Document:
              f"за а/м {p['car_brand']} {p['car_color']} "
              f"№{p['car_reg']} VIN {p['car_vin']}")
 
+    # Флаг, чтобы основание заменилось только один раз
+    osnov_replaced = False
+    
     for para in _iter_paragraphs(doc):
         full = _para_text(para)
         if not full.strip():
             continue
 
+        # Основание - заменяем только ОДИН раз
         if re.search(r"[Пп]о\s+ДКП|за\s+а/м|VIN\s+[A-Z0-9]{17}", full):
-            if para.runs:
+            if not osnov_replaced and para.runs:
                 para.runs[0].text = osnov
                 for r in para.runs[1:]: r.text = ""
+                osnov_replaced = True
             continue
 
+        # Сумма прописью
         if re.search(_WORDS_PAT, full) and not re.search(_DATE_PAT, full):
             new_full = re.sub(_WORDS_PAT, pv_words, full)
             if new_full != full and para.runs:
@@ -356,6 +384,7 @@ def process_pko(doc: Document, p: dict) -> Document:
                 for r in para.runs[1:]: r.text = ""
             continue
 
+        # НДС
         if re.search(r"НДС|22/122", full):
             new_full = re.sub(r"НДС\s*\(22/122%?\)[^\n]*", "Без НДС", full)
             new_full = re.sub(r"В том числе НДС[^\n]*", "Без НДС", new_full)
@@ -365,13 +394,18 @@ def process_pko(doc: Document, p: dict) -> Document:
                 for r in para.runs[1:]: r.text = ""
             continue
 
+        # Сумма цифрами (только если это не дата)
         if re.search(_AMOUNT_PAT, full) and not re.search(_DATE_PAT, full):
-            new_full = re.sub(_AMOUNT_PAT, pv_str, full)
-            if new_full != full and para.runs:
-                para.runs[0].text = new_full
-                for r in para.runs[1:]: r.text = ""
+            # Проверяем, не дата ли это
+            text_without_dates = re.sub(_DATE_PAT, "", full)
+            if re.search(_AMOUNT_PAT, text_without_dates):
+                new_full = re.sub(_AMOUNT_PAT, pv_str, full)
+                if new_full != full and para.runs:
+                    para.runs[0].text = new_full
+                    for r in para.runs[1:]: r.text = ""
             continue
 
+        # Дата
         if re.search(_DATE_PAT, full):
             new_full = re.sub(_DATE_PAT, date, full)
             if new_full != full and para.runs:
@@ -379,6 +413,7 @@ def process_pko(doc: Document, p: dict) -> Document:
                 for r in para.runs[1:]: r.text = ""
             continue
 
+        # ФИО покупателя
         m = re.search(r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+", full)
         if m and m.group(0) != buyer:
             new_full = full.replace(m.group(0), buyer)
@@ -464,18 +499,17 @@ def get_binary_file_downloader_html(bin_data, file_label='File'):
 def main():
     st.set_page_config(
         page_title="Fresh Auto - Генератор документов с ПВ",
-        page_icon=":car:",
+        page_icon="🚗",
         layout="wide"
     )
 
-    st.title(":car: Fresh Auto - Генератор документов с ПВ")
+    st.title("🚗 Fresh Auto - Генератор документов с ПВ")
     st.markdown("Автоматическое заполнение ДКП, ПКО и счетов при кредитных сделках")
 
     # Инициализация session_state для файлов
     if 'uploaded_files' not in st.session_state:
         st.session_state.uploaded_files = {}
     
-    # Используем колбэк для авто-заполнения
     def auto_fill():
         if 'inv1' in st.session_state.uploaded_files:
             try:
@@ -514,12 +548,12 @@ def main():
 
     # Боковая панель
     with st.sidebar:
-        st.header(":file_folder: Шаблоны документов")
+        st.header("📁 Шаблоны документов")
 
-        dkp_file = st.file_uploader("ДКП (шаблон)", type=['docx'], key='dkp')
-        pko_file = st.file_uploader("ПКО (шаблон)", type=['docx'], key='pko')
-        inv1_file = st.file_uploader("Счёт №1 (шаблон) :arrow_left: авто-заполнение", type=['docx'], key='inv1')
-        inv2_file = st.file_uploader("Счёт №2 (шаблон)", type=['docx'], key='inv2')
+        dkp_file = st.file_uploader("ДКП (шаблон)", type=['docx'], key='dkp_file')
+        pko_file = st.file_uploader("ПКО (шаблон)", type=['docx'], key='pko_file')
+        inv1_file = st.file_uploader("Счёт №1 (шаблон) ⬅️ авто-заполнение", type=['docx'], key='inv1_file')
+        inv2_file = st.file_uploader("Счёт №2 (шаблон)", type=['docx'], key='inv2_file')
 
         if dkp_file:
             st.session_state.uploaded_files['dkp'] = dkp_file.getvalue()
@@ -542,9 +576,8 @@ def main():
     col1, col2 = st.columns(2)
 
     with col1:
-        st.header(":clipboard: Данные сделки")
+        st.header("📋 Данные сделки")
 
-        # Инициализация значений по умолчанию
         if 'buyer_name' not in st.session_state:
             st.session_state.buyer_name = ''
         if 'dkp_number' not in st.session_state:
@@ -573,7 +606,7 @@ def main():
         car_reg = st.text_input("Гос. номер", key='car_reg', disabled=True)
 
     with col2:
-        st.header(":moneybag: Суммы")
+        st.header("💰 Суммы")
 
         real_price_str = st.text_input("Реальная цена авто (руб.)", key='real_price')
         pv_amount_str = st.text_input("Сумма искусственного ПВ (руб.)", key='pv_amount')
@@ -590,13 +623,13 @@ def main():
 
     # Кнопка авто-заполнения
     if 'inv1' in st.session_state.uploaded_files:
-        st.button(":arrows_counterclockwise: Авто-заполнить из Счёта №1", 
+        st.button("🔄 Авто-заполнить из Счёта №1", 
                  on_click=auto_fill, 
                  use_container_width=True)
 
     # Генерация
     st.markdown("---")
-    if st.button(":white_check_mark: Сгенерировать документы", type="primary", use_container_width=True):
+    if st.button("✅ Сгенерировать документы", type="primary", use_container_width=True):
         errors = []
         if 'dkp' not in st.session_state.uploaded_files:
             errors.append("Не загружен файл: ДКП")
