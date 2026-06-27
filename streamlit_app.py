@@ -252,123 +252,106 @@ def process_dkp(doc: Document, p: dict) -> Document:
     return doc
 
 # ==============================================================================
-# ПРОЦЕССОР ПКО — ПОЛНОСТЬЮ ПЕРЕПИСАН v3
+# ПРОЦЕССОР ПКО — v4 (написан под реальную структуру файла)
 # ==============================================================================
 
 def process_pko(doc: Document, p: dict) -> Document:
     """
-    Обрабатывает ПКО: таблицы + параграфы отдельно.
-    Меняет: сумму (цифры + пропись), дату, ФИО, основание, убирает НДС.
+    ПКО — структура: почти всё в параграфах, таблицы минимальны.
+    Замены делаются точечно по содержимому каждого параграфа.
     """
     pv_str   = format_amount(p["pv_amount"])
     pv_words = amount_to_words(p["pv_amount"])
     date     = p["date"]
     buyer    = p["buyer_name"]
-    osnov    = (f"По ДКП №{p['dkp_number']} от {date} "
-                f"за а/м {p['car_brand']} {p['car_color']} "
-                f"№{p['car_reg']} VIN {p['car_vin']}")
+    osnov1   = f"По ДКП №{p['dkp_number']} от {date}"
+    osnov2   = f"за а/м {p['car_brand']} {p['car_color']} № {p['car_reg']} VIN {p['car_vin']}"
+    osnov_full = f"{osnov1} {osnov2}"
 
-    # ── 1. ТАБЛИЦЫ ──────────────────────────────────────────────────────────
-    for tbl in doc.tables:
-        for row in tbl.rows:
-            for cell in row.cells:
-                txt = cell.text.strip()
-                if not txt:
-                    continue
+    DATE_FULL = r"\b\d{2}\.\d{2}\.\d{4}\b"
+    A_FULL    = r"\b\d[\d\s]{0,12}[,.]\d{2}\b"
+    W_FULL    = r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+(?:тысяч|миллион|миллиард|рубл)[а-яё\s\-\,]*\d{2}\s+копеек\s*"
 
-                # НДС строки — полностью стираем
-                if re.search(r"в том числе|ндс|22/122", txt, re.IGNORECASE):
-                    for para in cell.paragraphs:
-                        _set_para(para, "")
-                    continue
-
-                # Основание (строка с ДКП или VIN)
-                if re.search(r"[Пп]о\s+ДКП|VIN\s+[A-Z0-9]{10,}|дкп\s+№", txt, re.IGNORECASE):
-                    for para in cell.paragraphs:
-                        if _para_text(para).strip():
-                            _set_para(para, osnov)
-                    continue
-
-                # Только ячейки "Основание:" — добавляем основание рядом
-                if re.fullmatch(r"[Оо]снование\s*:?\s*", txt):
-                    # Текст основания в следующей ячейке — обработается выше
-                    continue
-
-                # ФИО покупателя — ячейка с тремя словами с заглавными
-                fio_m = re.match(
-                    r"^([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)$",
-                    txt)
-                if fio_m:
-                    for para in cell.paragraphs:
-                        if _para_text(para).strip():
-                            _set_para(para, buyer)
-                    continue
-
-
-                # Сумма прописью в ячейке
-                if re.search(W_PAT, txt):
-                    for para in cell.paragraphs:
-                        if _para_text(para).strip():
-                            nf = re.sub(W_PAT, pv_words, _para_text(para))
-                            _set_para(para, nf)
-                    continue
-
-                # Сумма цифрами (ячейка содержит только число)
-                if re.fullmatch(r"[\s\d\s]+[,.][\d]{2}", txt.replace(" ", "").replace("\xa0", "")):
-                    for para in cell.paragraphs:
-                        if _para_text(para).strip():
-                            nf = re.sub(A_PAT, pv_str, _para_text(para))
-                            _set_para(para, nf)
-                    continue
-
-                # Дата (ячейка только с датой)
-                if re.fullmatch(DATE_PAT, txt):
-                    for para in cell.paragraphs:
-                        if _para_text(para).strip():
-                            nf = re.sub(DATE_PAT, date, _para_text(para))
-                            _set_para(para, nf)
-                    continue
-
-    # ── 2. ПАРАГРАФЫ (вне таблиц) ───────────────────────────────────────────
     for para in doc.paragraphs:
         full = _para_text(para)
-        ns   = full.strip()
-        if not ns:
+        t    = full.strip()
+        if not t:
             continue
 
-        # НДС — убираем полностью
-        if re.search(r"в том числе|ндс|22/122", ns, re.IGNORECASE):
+        # "от ДД.ММ.ГГГГ" — дата в шапке
+        if re.match(r"^от\s+\d{2}\.\d{2}\.\d{4}$", t):
+            _set_para(para, f"от {date}")
+            continue
+
+        # "подразделение\tФИО" — ФИО в правой части шапки
+        if t.startswith("подразделение") and "\t" in full:
+            _set_para(para, full[: full.index("\t") + 1] + buyer)
+            continue
+
+        # "По ДКП №... от дата" — первая строка основания (без "за а/м")
+        if re.match(r"^По ДКП №", t) and "за а/м" not in t:
+            _set_para(para, osnov1)
+            continue
+
+        # "за а/м ..." — вторая строка основания
+        if t.startswith("за а/м "):
+            _set_para(para, osnov2)
+            continue
+
+        # "По ДКП №... за а/м..." — полное основание одной строкой
+        if re.match(r"^По ДКП №", t) and "за а/м" in t:
+            _set_para(para, osnov_full)
+            continue
+
+        # "Сумма\t428 000,00" — сумма цифрами в квитанции
+        if re.match(r"^Сумма", t) and re.search(A_FULL, t):
+            _set_para(para, re.sub(A_FULL, pv_str, full))
+            continue
+
+        # "Принято от: ФИО\tпропись" — ФИО + пропись через таб
+        if t.startswith("Принято от:") and "\t" in full:
+            _set_para(para, f"Принято от: {buyer}\t{pv_words}")
+            continue
+
+        # Только прописью (квитанция — правая часть)
+        if re.match(W_FULL, t) and not re.search(r"Принято|Основание|Сумма", t):
+            _set_para(para, pv_words)
+            continue
+
+        # "В том числе" + "НДС..." — убираем обе строки
+        if t in ("В том числе", "В том числе:"):
             _set_para(para, "")
             continue
 
-        # Строка прописи суммы (начинается с заглавной, содержит тысяч/миллион)
-        if re.search(W_PAT, ns):
-            nf = re.sub(W_PAT, pv_words, full)
-            if nf != full:
-                _set_para(para, nf)
+        if re.match(r"НДС\s*\(22/122\)", t):
+            _set_para(para, "")
             continue
 
-        # Строка "Сумма:" с прописью
-        if re.match(r"[Сс]умма\s*:", ns) and re.search(W_PAT, ns):
-            nf = "Сумма: " + pv_words
-            _set_para(para, nf)
+        # "В том числе: НДС...\tМ.П. (штампа)" — оставляем только М.П.
+        if t.startswith("В том числе") and "НДС" in t and "\t" in full:
+            _set_para(para, "\t" + full[full.index("\t") + 1:])
             continue
 
-        # Сумма цифрами (строка только с суммой)
-        if re.fullmatch(r"\s*" + A_PAT + r"\s*", ns):
-            _set_para(para, pv_str)
-            continue
-
-        # Дата (строка только с датой)
-        if re.fullmatch(DATE_PAT, ns):
+        # Голая дата "ДД.ММ.ГГГГ"
+        if re.fullmatch(DATE_FULL, t):
             _set_para(para, date)
             continue
 
-        # Дата внутри текста
-        if re.search(DATE_PAT, ns):
-            nf = re.sub(DATE_PAT, date, full)
-            if nf != full:
-                _set_para(para, nf)
+    # Таблицы (их мало, но на всякий случай — дата и ФИО)
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    ct = para.text.strip()
+                    if re.fullmatch(DATE_FULL, ct):
+                        _set_para(para, date)
+                    elif re.search(r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+", ct):
+                        # ФИО — три слова с заглавной, но не "Главный бухгалтер" и т.п.
+                        if not re.search(r"Главный|Кассир|Робот|Принято|КАССОВЫЙ", ct):
+                            _set_para(para, buyer)
+                    elif (re.search(A_FULL, ct) and
+                          not re.search(r"18\.08|88|0310001|ОКУД|ОКПО|КО-1|ЦБ", ct)):
+                        _set_para(para, re.sub(A_FULL, pv_str, _para_text(para)))
 
     return doc
 
