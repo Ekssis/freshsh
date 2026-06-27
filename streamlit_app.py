@@ -1,6 +1,6 @@
 """
 FRESH - Генератор документов с искусственным ПВ
-Автоматическое заполнение ДКП, ПКО и счетов при кредитных сделках
+Автоматическое заполнение ДКП, ПКО и счетов при кредищих сделках
 """
 
 import streamlit as st
@@ -12,6 +12,7 @@ try:
     from docx import Document
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
+    from docx.shared import Pt
     import num2words as nw
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install",
@@ -19,6 +20,7 @@ except ImportError:
     from docx import Document
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
+    from docx.shared import Pt
     import num2words as nw
 
 # ==============================================================================
@@ -100,17 +102,24 @@ def _replace_para_text(para, new_text):
         first_run._element.append(style)
 
 def insert_paragraph_after(paragraph, text, style_source_para=None):
-    """Безопасная вставка нового абзаца строго после текущего"""
+    """Вставка абзаца строго после текущего с принудительным размером шрифта 8pt"""
     new_p = OxmlElement('w:p')
     paragraph._p.getparent().insert(paragraph._p.getparent().index(paragraph._p) + 1, new_p)
     new_para = paragraph.__class__(new_p, paragraph._parent)
-    new_para.text = text
     
+    # Создаем раны с текстом и жестко ставим 8pt
+    run = new_para.add_run(text)
+    run.font.size = Pt(8)
+    
+    # Копируем базовые стили (шрифт Arial/Times), если они есть
     if style_source_para and style_source_para.runs:
         src_run = style_source_para.runs[0]
-        style = src_run._element.find(qn("w:rPr"))
-        if style is not None and new_para.runs:
-            new_para.runs[0]._element.append(style)
+        run.font.name = src_run.font.name
+        
+    # Настройки абзаца (чтобы не было огромных отступов)
+    new_para.paragraph_format.space_before = Pt(0)
+    new_para.paragraph_format.space_after = Pt(4)
+    new_para.paragraph_format.line_spacing = 1.0
             
     return new_para
 
@@ -121,9 +130,12 @@ _WORDS_PAT = (r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+"
 _DATE_PAT = r"\b\d{2}\.\d{2}\.\d{4}\b"
 
 def _remove_nds(text: str) -> str:
-    text = re.sub(r",?\s*в\s+т\.?\s*ч\.?\s*НДС[^.;\n]*", "", text)
-    text = re.sub(r"(22/122%?)\s*[\d\s,]+руб\.?", "", text)
-    text = re.sub(r"НДС\s*(22/122%?)\s*[\d\s,]+руб\.?", "без НДС", text)
+    # Агрессивное удаление НДС с учетом возможных переносов строк и пробелов
+    text = re.sub(r",?\s*в\s+т\.?\s*ч\.?\s*НДС[^.;\n]*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\(?22/122%?\)?\s*[\d\s,.]+руб\.?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"НДС\s*\(?22/122%?\)?\s*[\d\s,.]+руб\.?", "", text, flags=re.IGNORECASE)
+    # Чистим двойные пробелы в конце
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 def extract_invoice_data(doc: Document) -> dict:
@@ -196,40 +208,54 @@ def process_dkp(doc: Document, p: dict) -> Document:
     target_payment_para = None
     
     for para in doc.paragraphs:
+        # Убираем разрывы строк внутри абзаца и схлопываем множественные пробелы
         full = _para_text(para)
-        if not full.strip():
+        full_normalized = re.sub(r"\s+", " ", full).strip()
+        
+        if not full_normalized:
             continue
         
-        # Запоминаем абзац, после которого нужно вставить ПВ, если его нет в шаблоне
-        if full.strip().startswith("Цена ТС оплачивается Покупателем в течение"):
+        # Маркер для вставки
+        if full_normalized.startswith("Цена ТС оплачивается Покупателем в течение"):
             target_payment_para = para
         
-        # Фильтр технической защиты (пропускаем эти пункты, чтобы не сбить лимиты гарантии)
-        if any(word in full.lower() for word in ["гаранти", "техническая защита", "лимит ответственности", "пробег"]):
+        if any(word in full_normalized.lower() for word in ["гаранти", "техническая защита", "лимит ответственности", "пробег"]):
             continue
-            
-        clean_full = _remove_nds(full)
-        has_amount = re.search(_AMOUNT_PAT, clean_full)
-        has_words = re.search(_WORDS_PAT, clean_full)
+
+        # Проверяем наличие сумм и слов на нормализованном тексте
+        has_amount = re.search(_AMOUNT_PAT, full_normalized)
+        has_words = re.search(_WORDS_PAT, full_normalized)
         
-        # Если пункт ПВ уже был изначально в шаблоне
-        if "первоначальный" in full.lower() or "взнос" in full.lower():
+        # 1. Если это пункт ПВ
+        if "первоначальный" in full_normalized.lower() or "взнос" in full_normalized.lower():
+            clean_full = full_normalized
             if has_amount:
                 clean_full = re.sub(_AMOUNT_PAT, pv_str, clean_full)
             if has_words:
                 clean_full = re.sub(_WORDS_PAT, pv_words, clean_full)
             _replace_para_text(para, clean_full)
+            
+            # Принудительно уменьшаем шрифт у ПВ до 8pt
+            for run in para.runs:
+                run.font.size = Pt(8)
+                
             pv_para_found = True
         
-        # Если это основная стоимость ТС (цена договора)
-        elif any(marker in full.lower() for marker in ["цена договора", "стоимость тс", "цена тс", "стоимость автомобиля", "уплачивает покупатель"]):
-            if has_amount and has_words:
+        # 2. Если это пункт цены договора
+        elif any(marker in full_normalized.lower() for marker in ["цена договора", "стоимость тс", "цена тс", "стоимость автомобиля", "уплачивает покупатель"]):
+            # Удаляем НДС из текста
+            clean_full = _remove_nds(full_normalized)
+            
+            # Снова ищем паттерны на очищенной от НДС строке
+            if re.search(_AMOUNT_PAT, clean_full) and re.search(_WORDS_PAT, clean_full):
                 clean_full = re.sub(_AMOUNT_PAT, new_str, clean_full)
                 clean_full = re.sub(_WORDS_PAT, new_words, clean_full)
-                _replace_para_text(para, clean_full)
-            elif has_amount:
+            elif re.search(_AMOUNT_PAT, clean_full):
                 clean_full = re.sub(_AMOUNT_PAT, new_str, clean_full)
-                _replace_para_text(para, clean_full)
+                
+            # Дополнительный фикс на случай, если "руб" или скобки остались кривыми после удаления НДС
+            clean_full = clean_full.replace("( )", "").replace(" )", ")")
+            _replace_para_text(para, clean_full)
 
     # Если пункта ПВ вообще не было в документе, создаем его строго ПОСЛЕ абзаца об оплате
     if not pv_para_found and target_payment_para is not None:
