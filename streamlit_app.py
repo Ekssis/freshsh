@@ -207,60 +207,62 @@ def process_dkp(doc: Document, p: dict) -> Document:
     pv_para_found = False
     target_payment_para = None
     
+    # Модифицированные регулярки: теперь им не важны пробелы вокруг скобок и копеек
+    A_PAT = r"\b\d[\d\s]{0,12}[,.]\d{2}\b"
+    W_PAT = r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+(?:тысяч|миллион|миллиард|рубл)[а-яё\s\-\,]*\d{2}\s+копеек\s*\)?"
+
     for para in doc.paragraphs:
-        # Собираем весь текст абзаца в одну монолитную строку
         full = "".join(r.text for r in para.runs)
         full_normalized = re.sub(r"\s+", " ", full).strip()
         
         if not full_normalized:
             continue
         
-        # Маркер для динамической вставки ПВ
         if full_normalized.startswith("Цена ТС оплачивается Покупателем в течение"):
             target_payment_para = para
         
-        # Защита лимитов/гарантий от изменений
         if any(word in full_normalized.lower() for word in ["гаранти", "техническая защита", "лимит ответственности", "пробег"]):
             continue
 
-        # 1. Корректируем пункт с Первоначальным Взносом (если он уже есть в шаблоне)
+        # 1. Корректируем пункт с Первоначальным Взносом
         if "первоначальный" in full_normalized.lower() or "взнос" in full_normalized.lower():
             clean_full = full_normalized
-            if re.search(_AMOUNT_PAT, clean_full):
-                clean_full = re.sub(_AMOUNT_PAT, pv_str, clean_full)
-            if re.search(_WORDS_PAT, clean_full):
-                clean_full = re.sub(_WORDS_PAT, pv_words, clean_full)
+            if re.search(A_PAT, clean_full):
+                clean_full = re.sub(A_PAT, pv_str, clean_full)
+            if re.search(W_PAT, clean_full):
+                clean_full = re.sub(W_PAT, pv_words, clean_full)
             
-            # Полностью пересоздаем текст в абзаце, чтобы убрать скрытые разрывы Word
             para.text = ""
             run = para.add_run(clean_full)
-            run.font.size = Pt(8)  # Принудительно 8pt для ПВ
+            run.font.size = Pt(8)  
             pv_para_found = True
         
-        # 2. Корректируем пункт Основной Цены (и вырезаем НДС)
-        elif any(marker in full_normalized.lower() for marker in ["цена договора", "стоимость тс", "цена тс", "стоимость автомобиля", "уплачивает покупатель"]):
-            # Сначала агрессивно удаляем НДС из единой строки
+        # 2. Корректируем пункт цены (расширили маркеры, включая "цену за тс")
+        elif any(marker in full_normalized.lower() for marker in ["цена договора", "стоимость тс", "цена тс", "цену за тс", "стоимость автомобиля", "уплачивает покупатель"]):
+            # Первым делом сносим НДС из нормализованной строки
             clean_full = _remove_nds(full_normalized)
             
-            # Теперь заменяем старую цену (цифры и пропись) на новую общую сумму с ПВ
-            if re.search(_AMOUNT_PAT, clean_full) and re.search(_WORDS_PAT, clean_full):
-                clean_full = re.sub(_AMOUNT_PAT, new_str, clean_full)
-                clean_full = re.sub(_WORDS_PAT, new_words, clean_full)
-            elif re.search(_AMOUNT_PAT, clean_full):
-                clean_full = re.sub(_AMOUNT_PAT, new_str, clean_full)
+            # Ищем и меняем сумму / пропись с учетом гибкого паттерна копеек
+            has_amt = re.search(A_PAT, clean_full)
+            has_wrd = re.search(W_PAT, clean_full)
             
-            # Финальная зачистка артефактов
-            clean_full = clean_full.replace("( )", "").replace(" )", ")").strip()
-            if clean_full.endswith(","):
-                clean_full = clean_full[:-1].strip()
+            if has_amt and has_wrd:
+                clean_full = re.sub(A_PAT, new_str, clean_full)
+                clean_full = re.sub(W_PAT, new_words + " )" if ")" in has_wrd.group(0) else new_words, clean_full)
+            elif has_amt:
+                clean_full = re.sub(A_PAT, new_str, clean_full)
+            
+            # Убираем возможные двойные закрывающие скобки и зависшие запятые после сноса НДС
+            clean_full = clean_full.replace(" ) )", " )").replace("))", ")")
+            clean_full = re.sub(r",\s*\.", ".", clean_full)
+            clean_full = re.sub(r"\s+", " ", clean_full).strip()
+            
             if not clean_full.endswith("."):
                 clean_full += "."
-                
-            # Полностью заменяем внутренности абзаца на чистый текст без старых ранов Word
+
             para.text = ""
             para.add_run(clean_full)
 
-    # Если пункта ПВ вообще не было в документе, создаем его строго ПОСЛЕ абзаца об оплате
     if not pv_para_found and target_payment_para is not None:
         pv_text = f"Первоначальный взнос по оплате цены Договора составляет {pv_str} руб ({pv_words})."
         insert_paragraph_after(target_payment_para, pv_text, style_source_para=target_payment_para)
