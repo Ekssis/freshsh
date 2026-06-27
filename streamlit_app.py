@@ -14,6 +14,7 @@ try:
     from docx import Document
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
+    from docx.text.paragraph import Paragraph
     import num2words as nw
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install",
@@ -21,6 +22,7 @@ except ImportError:
     from docx import Document
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
+    from docx.text.paragraph import Paragraph
     import num2words as nw
 
 # ==============================================================================
@@ -90,23 +92,6 @@ def _para_text(para) -> str:
     """Полный текст параграфа из всех runs"""
     return "".join(r.text for r in para.runs)
 
-def _replace_in_para(para, old: str, new: str) -> bool:
-    """Заменяет old->new в параграфе, сохраняя форматирование"""
-    for run in para.runs:
-        if old in run.text:
-            run.text = run.text.replace(old, new)
-            return True
-
-    full = _para_text(para)
-    if old not in full:
-        return False
-    new_full = full.replace(old, new)
-    if para.runs:
-        para.runs[0].text = new_full
-        for r in para.runs[1:]:
-            r.text = ""
-    return True
-
 # Паттерны для сумм
 _AMOUNT_PAT = r"\d[\d\s]*\d[,.]\d{2}"
 _WORDS_PAT = (r"[А-ЯЁ][а-яёА-ЯЁ\s]+"
@@ -115,9 +100,9 @@ _WORDS_PAT = (r"[А-ЯЁ][а-яёА-ЯЁ\s]+"
 
 def _remove_nds(text: str) -> str:
     """Убирает все упоминания НДС из строки"""
-    text = re.sub(r",?\s*в\s+т.?\s*ч.?\s*НДС[^.;\n]*", "", text)
-    text = re.sub(r"(22/122%?)\s*[\d\s,]+руб.?", "", text)
-    text = re.sub(r"НДС\s*(22/122%?)\s*[\d\s,]+руб.?", "без НДС", text)
+    text = re.sub(r",?\s*в\s+т\.?\s*ч\.?\s*НДС[^.;\n]*", "", text)
+    text = re.sub(r"(22/122%?)\s*[\d\s,]+руб\.?", "", text)
+    text = re.sub(r"НДС\s*(22/122%?)\s*[\d\s,]+руб\.?", "без НДС", text)
     return text
 
 # ==============================================================================
@@ -201,71 +186,49 @@ def process_dkp(doc: Document, p: dict) -> Document:
 
     pv_para_found = False
 
-    # Собираем ВСЕ параграфы из всех мест документа
+    # Собираем ВСЕ параграфы
     all_paragraphs = []
     
-    # Основное тело документа
     for para in doc.paragraphs:
-        all_paragraphs.append(('body', para))
+        all_paragraphs.append(para)
     
-    # Таблицы в теле документа
     for tbl in doc.tables:
         for row in tbl.rows:
             for cell in row.cells:
                 for para in cell.paragraphs:
-                    all_paragraphs.append(('table', para))
+                    all_paragraphs.append(para)
     
-    # Секции (колонтитулы, где часто находится Акт приема-передачи)
     for section in doc.sections:
-        # Header
         header = section.header
         if header:
             for para in header.paragraphs:
-                all_paragraphs.append(('header', para))
+                all_paragraphs.append(para)
             for tbl in header.tables:
                 for row in tbl.rows:
                     for cell in row.cells:
                         for para in cell.paragraphs:
-                            all_paragraphs.append(('header_table', para))
+                            all_paragraphs.append(para)
         
-        # Footer
         footer = section.footer
         if footer:
             for para in footer.paragraphs:
-                all_paragraphs.append(('footer', para))
+                all_paragraphs.append(para)
             for tbl in footer.tables:
                 for row in tbl.rows:
                     for cell in row.cells:
                         for para in cell.paragraphs:
-                            all_paragraphs.append(('footer_table', para))
-    
-    # Также проверяем текстовые рамки (text boxes) в XML
-    for elem in doc.element.iter():
-        if elem.tag.endswith('}txbxContent') or elem.tag.endswith('}txbx'):
-            # Это текстовое поле
-            from docx import Document as DocParser
-            # Обрабатываем каждый параграф внутри текстового поля
-            for para_elem in elem.iter():
-                if para_elem.tag.endswith('}p'):
-                    # Создаем параграф из элемента
-                    from docx.text.paragraph import Paragraph
-                    para = Paragraph(para_elem, None)
-                    if para.text.strip():
-                        all_paragraphs.append(('textbox', para))
+                            all_paragraphs.append(para)
 
-    # Теперь обрабатываем все собранные параграфы
-    for location, para in all_paragraphs:
+    # Обрабатываем все параграфы
+    for para in all_paragraphs:
         full = _para_text(para)
         if not full.strip():
             continue
 
-        # Проверяем, содержит ли параграф и сумму цифрами, и сумму прописью
         has_amount = re.search(_AMOUNT_PAT, full)
         has_words = re.search(_WORDS_PAT, full)
         
         if has_amount and has_words:
-            # Это строка с полной суммой (например, "2 138 000,00 руб (Два миллиона...)"
-            print(f"Найдена полная сумма в {location}: {full}")
             new_full = re.sub(_AMOUNT_PAT, new_str, full)
             new_full = re.sub(_WORDS_PAT, new_words, new_full)
             new_full = _remove_nds(new_full)
@@ -275,9 +238,7 @@ def process_dkp(doc: Document, p: dict) -> Document:
                     r.text = ""
                     
         elif has_amount and not has_words:
-            # Только сумма цифрами, без прописи
             if "первоначальный взнос" in full.lower():
-                # Это строка с первоначальным взносом
                 new_full = re.sub(_AMOUNT_PAT, pv_str, full)
                 pv_para_found = True
             else:
@@ -289,7 +250,6 @@ def process_dkp(doc: Document, p: dict) -> Document:
                     r.text = ""
 
         elif has_words and not has_amount:
-            # Только сумма прописью
             if "первоначальный взнос" in full.lower():
                 new_full = re.sub(_WORDS_PAT, pv_words, full)
                 pv_para_found = True
@@ -300,7 +260,6 @@ def process_dkp(doc: Document, p: dict) -> Document:
                 for r in para.runs[1:]:
                     r.text = ""
 
-        # Убираем НДС в строках без суммы
         if re.search(r"НДС|22/122", full) and not has_amount and not has_words:
             new_full = _remove_nds(full)
             if new_full != full and para.runs:
@@ -308,11 +267,9 @@ def process_dkp(doc: Document, p: dict) -> Document:
                 for r in para.runs[1:]:
                     r.text = ""
 
-        # Проверяем наличие пункта про ПВ (отдельно)
         if "первоначальный взнос" in full.lower():
             pv_para_found = True
 
-    # Если пункта про ПВ нет - добавляем после первого параграфа с ценой
     if not pv_para_found:
         pv_text = (f"Первоначальный взнос по оплате цены Договора составляет "
                    f"{pv_str} руб ({pv_words}).")
@@ -331,6 +288,66 @@ def process_dkp(doc: Document, p: dict) -> Document:
                 new_p.append(new_r)
                 para._element.addnext(new_p)
                 break
+
+    return doc
+
+def process_pko(doc: Document, p: dict) -> Document:
+    """Обработка ПКО"""
+    pv_str = format_amount(p["pv_amount"])
+    pv_words = amount_to_words(p["pv_amount"])
+    date = p["date"]
+    buyer = p["buyer_name"]
+    osnov = (f"По ДКП №{p['dkp_number']} от {date} "
+             f"за а/м {p['car_brand']} {p['car_color']} "
+             f"№{p['car_reg']} VIN {p['car_vin']}")
+
+    for para in _iter_paragraphs(doc):
+        full = _para_text(para)
+        if not full.strip():
+            continue
+
+        if re.search(r"[Пп]о\s+ДКП|за\s+а/м|VIN\s+[A-Z0-9]{17}", full):
+            if para.runs:
+                para.runs[0].text = osnov
+                for r in para.runs[1:]: r.text = ""
+            continue
+
+        if re.search(_WORDS_PAT, full):
+            new_full = re.sub(_WORDS_PAT, pv_words, full)
+            if new_full != full and para.runs:
+                para.runs[0].text = new_full
+                for r in para.runs[1:]: r.text = ""
+            continue
+
+        if re.search(r"НДС|22/122", full):
+            new_full = re.sub(r"НДС\s*\(22/122%?\)[^\n]*", "Без НДС", full)
+            new_full = re.sub(r"В том числе НДС[^\n]*", "Без НДС", new_full)
+            new_full = _remove_nds(new_full)
+            if new_full != full and para.runs:
+                para.runs[0].text = new_full
+                for r in para.runs[1:]: r.text = ""
+            continue
+
+        if re.search(_AMOUNT_PAT, full) and not re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", full):
+            new_full = re.sub(_AMOUNT_PAT, pv_str, full)
+            if new_full != full and para.runs:
+                para.runs[0].text = new_full
+                for r in para.runs[1:]: r.text = ""
+            continue
+
+        if re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", full):
+            new_full = re.sub(r"\b\d{2}\.\d{2}\.\d{4}\b", date, full)
+            if new_full != full and para.runs:
+                para.runs[0].text = new_full
+                for r in para.runs[1:]: r.text = ""
+            continue
+
+        m = re.search(r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+", full)
+        if m and m.group(0) != buyer:
+            new_full = full.replace(m.group(0), buyer)
+            if new_full != full and para.runs:
+                para.runs[0].text = new_full
+                for r in para.runs[1:]: r.text = ""
 
     return doc
 
@@ -419,7 +436,7 @@ def main():
     st.title(":car: Fresh Auto - Генератор документов с ПВ")
     st.markdown("Автоматическое заполнение ДКП, ПКО и счетов при кредитных сделках")
 
-    # Инициализация session_state для хранения файлов
+    # Инициализация session_state
     if 'uploaded_files' not in st.session_state:
         st.session_state.uploaded_files = {}
     if 'form_data' not in st.session_state:
@@ -435,7 +452,7 @@ def main():
             'pv_amount': ''
         }
 
-    # Боковая панель для загрузки файлов
+    # Боковая панель
     with st.sidebar:
         st.header(":file_folder: Шаблоны документов")
 
@@ -444,7 +461,6 @@ def main():
         inv1_file = st.file_uploader("Счёт №1 (шаблон) :arrow_left: авто-заполнение", type=['docx'], key='inv1')
         inv2_file = st.file_uploader("Счёт №2 (шаблон)", type=['docx'], key='inv2')
 
-        # Сохраняем файлы в session_state
         if dkp_file:
             st.session_state.uploaded_files['dkp'] = dkp_file.getvalue()
         if pko_file:
@@ -515,7 +531,7 @@ def main():
         except:
             pass
 
-    # Авто-заполнение из Счёта №1
+    # Авто-заполнение
     if 'inv1' in st.session_state.uploaded_files:
         if st.button(":arrows_counterclockwise: Авто-заполнить из Счёта №1", use_container_width=True):
             try:
@@ -553,10 +569,9 @@ def main():
             except Exception as e:
                 st.error(f"Ошибка парсинга: {e}")
 
-    # Генерация документов
+    # Генерация
     st.markdown("---")
     if st.button(":white_check_mark: Сгенерировать документы", type="primary", use_container_width=True):
-        # Валидация
         errors = []
         if 'dkp' not in st.session_state.uploaded_files:
             errors.append("Не загружен файл: ДКП")
@@ -597,14 +612,10 @@ def main():
             date_safe = date.replace(".", "-")
 
             tasks = [
-                ("dkp", f"ДКП_{surname}_{date_safe}.docx",
-                 lambda d, p: process_dkp(d, p)),
-                ("pko", f"ПКО_{surname}_{date_safe}.docx",
-                 lambda d, p: process_pko(d, p)),
-                ("inv1", f"Счёт1_{surname}_{date_safe}.docx",
-                 lambda d, p: process_invoice(d, p, p["new_price"])),
-                ("inv2", f"Счёт2_{surname}_{date_safe}.docx",
-                 lambda d, p: process_invoice(d, p, p["real_price"])),
+                ("dkp", f"ДКП_{surname}_{date_safe}.docx", process_dkp),
+                ("pko", f"ПКО_{surname}_{date_safe}.docx", process_pko),
+                ("inv1", f"Счёт1_{surname}_{date_safe}.docx", lambda d, p: process_invoice(d, p, p["new_price"])),
+                ("inv2", f"Счёт2_{surname}_{date_safe}.docx", lambda d, p: process_invoice(d, p, p["real_price"])),
             ]
 
             progress_bar = st.progress(0)
@@ -618,7 +629,6 @@ def main():
                     doc = Document(BytesIO(st.session_state.uploaded_files[key]))
                     doc = processor(doc, params)
                     
-                    # Сохраняем в BytesIO
                     output = BytesIO()
                     doc.save(output)
                     output.seek(0)
@@ -634,7 +644,6 @@ def main():
             if len(generated_files) == 4:
                 st.success(f"✅ Успешно сгенерировано {len(generated_files)} документа!")
                 
-                # Показываем ссылки для скачивания
                 st.subheader("Скачать документы:")
                 for fname, data in generated_files:
                     st.markdown(
