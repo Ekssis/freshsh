@@ -1,4 +1,4 @@
-cat > /home/claude/fresh_auto_docs/streamlit_app.py << 'PYEOF'
+
 """
 Fresh Auto — Генератор документов с искусственным ПВ
 Streamlit web-интерфейс
@@ -615,5 +615,4 @@ if btn_generate:
 
 st.divider()
 st.caption("Fresh Auto · Генератор документов с ПВ · v2.0")
-PYEOF
-echo "Done: $(wc -l < /home/claude/fresh_auto_docs/streamlit_app.py) lines"
+
