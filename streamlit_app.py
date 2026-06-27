@@ -267,65 +267,62 @@ def process_dkp(doc: Document, p: dict) -> Document:
 
     return doc
 def process_pko(doc: Document, p: dict) -> Document:
+    # Сумма первоначального взноса (в вашем случае 400 000,00)
     pv_str = format_amount(p["pv_amount"])
     pv_words = amount_to_words(p["pv_amount"])
     date = p["date"]
     
-    # Формируем чистое однострочное основание
-    osnov = (f"По ДКП №{p['dkp_number']} от {date} "
-             f"за а/м {p['car_brand']} {p['car_color']} "
-             f"№{p['car_reg']} VIN {p['car_vin']}")
+    # Формируем чистое однострочное основание для замены
+    osnov_text = (f"По ДКП №{p['dkp_number']} от {date} "
+                  f"за а/м {p['car_brand']} {p['car_color']} "
+                  f"№{p['car_reg']} VIN {p['car_vin']}")
 
+    # Регулярные выражения для поиска ЛЮБЫХ старых сумм и прописи (независимо от копеек и пробелов)
     A_PAT = r"\b\d[\d\s]{0,12}[,.]\d{2}\b"
-    W_PAT = r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+(?:тысяч|миллион|миллиард|рубл)[а-яё\s\-\,]*\d{2}\s+копеек\s*\)?"
+    W_PAT = r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+(?:тысяч|миллион|миллиард|рубл)[а-яё\s\-\,]*\d{2}\s+копеек"
 
-    # Обрабатываем абсолютно все таблицы бланка
+    # Обрабатываем абсолютно все таблицы документа ПКО
     for tbl in doc.tables:
         for row in tbl.rows:
             for cell in row.cells:
                 for para in cell.paragraphs:
-                    full_normalized = re.sub(r"\s+", " ", para.text).strip()
+                    txt = para.text
+                    txt_normalized = re.sub(r"\s+", " ", txt).strip()
                     
-                    if not full_normalized:
+                    if not txt_normalized:
                         continue
 
-                    # 1. Полностью убираем упоминания НДС в любом регистре
-                    if "в том числе" in full_normalized.lower() or "ндс" in full_normalized.lower():
-                        para.text = ""  # Вычищаем текст абзаца с НДС
+                    # 1. Полностью вырезаем блоки с НДС
+                    if "в том числе" in txt_normalized.lower() or "ндс" in txt_normalized.lower():
+                        para.text = ""  # Здесь очистка безопасна, так как НДС идет отдельной строкой
                         continue
 
-                    # 2. Обрабатываем левое поле "Основание:"
-                    if full_normalized.startswith("Основание:"):
-                        para.text = ""
-                        run = para.add_run(f"Основание: {osnov}")
-                        run.font.size = Pt(8)
-                        continue
+                    is_updated = False
 
-                    # 3. Обрабатываем правое поле основания (где ключевые слова ДКП или VIN)
-                    if ("дкп" in full_normalized.lower() or "vin" in full_normalized.lower()) and "кассир" not in full_normalized.lower():
-                        para.text = ""
-                        run = para.add_run(osnov)
-                        run.font.size = Pt(8)
-                        continue
+                    # 2. Обрабатываем поле "Основание:" (в левой части)
+                    if txt_normalized.startswith("Основание:"):
+                        para.text = f"Основание: {osnov_text}"
+                        is_updated = True
 
-                    # 4. Меняем пропись суммы (Принято от... / Сумма прописью)
-                    if re.search(W_PAT, full_normalized):
-                        # Заменяем только найденную пропись суммы на pv_words
-                        new_text = re.sub(W_PAT, pv_words, para.text)
-                        para.text = ""
-                        run = para.add_run(new_text)
-                        run.font.size = Pt(8)
-                        continue
+                    # 3. Обрабатываем правое поле основания (где есть упоминание ДКП или VIN автомобиля)
+                    elif ("дкп" in txt_normalized.lower() or "vin" in txt_normalized.lower()) and "кассир" not in txt_normalized.lower():
+                        para.text = osnov_text
+                        is_updated = True
 
-                    # 5. Меняем цифры суммы (например, "Сумма 428 000,00" или в таблице дебета/кредита)
-                    if re.search(A_PAT, full_normalized):
-                        # Если это просто числовое поле в таблице или поле, содержащее слово "сумма"
-                        if "сумма" in full_normalized.lower() or re.match(r"^[\d\s.,]+$", full_normalized):
-                            new_text = re.sub(A_PAT, pv_str, para.text)
-                            para.text = ""
-                            run = para.add_run(new_text)
+                    # 4. Меняем пропись суммы (Четыреста двадцать восемь тысяч...)
+                    elif re.search(W_PAT, txt_normalized):
+                        para.text = re.sub(W_PAT, pv_words, txt)
+                        is_updated = True
+
+                    # 5. Меняем числовые суммы (и в тексте "Сумма 428 000,00", и в центральной таблице)
+                    elif re.search(A_PAT, txt_normalized):
+                        para.text = re.sub(A_PAT, pv_str, txt)
+                        is_updated = True
+
+                    # Если абзац был обновлен, принудительно выставляем ему шрифт 8pt
+                    if is_updated:
+                        for run in para.runs:
                             run.font.size = Pt(8)
-                            continue
 
     return doc
 
