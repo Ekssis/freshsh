@@ -271,45 +271,92 @@ def process_pko(doc: Document, p: dict) -> Document:
     pv_words = amount_to_words(p["pv_amount"])
     date = p["date"]
     
+    # Формируем чистое основание без дублирования
     osnov = (f"По ДКП №{p['dkp_number']} от {date} "
              f"за а/м {p['car_brand']} {p['car_color']} "
              f"№{p['car_reg']} VIN {p['car_vin']}")
 
-    for para in _iter_paragraphs(doc):
-        full = _para_text(para)
-        if not full.strip():
+    # Регулярки для поиска сумм, прописи и НДС
+    A_PAT = r"\b\d[\d\s]{0,12}[,.]\d{2}\b"
+    W_PAT = r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+(?:тысяч|миллион|миллиард|рубл)[а-яё\s\-\,]*\d{2}\s+копеек\s*\)?"
+
+    # 1. Сначала чистим все текстовые абзацы (Основание, Пропись, НДС)
+    for para in doc.paragraphs:
+        full = "".join(r.text for r in para.runs)
+        full_normalized = re.sub(r"\s+", " ", full).strip()
+        
+        if not full_normalized:
             continue
 
-        if "техническая защита" in full.lower() or "лимит" in full.lower():
+        # Пропускаем техническую защиту
+        if "техническая защита" in full_normalized.lower() or "лимит" in full_normalized.lower():
             continue
 
-        if re.search(r"Основание:", full, re.IGNORECASE) or (re.search(r"ДКП|а/м|VIN", full) and "кассир" not in full.lower() and "получено" not in full.lower()):
-            _replace_para_text(para, f"Основание: {osnov}" if "Основание:" in full else osnov)
+        # Убираем НДС полностью
+        if "в том числе" in full_normalized.lower() and "ндс" in full_normalized.lower():
+            para.text = ""  # Просто стираем этот абзац
             continue
 
-        if re.search(_WORDS_PAT, full) and any(m in full.lower() for m in ["принято", "сумма", "руб"]):
-            new_full = re.sub(_WORDS_PAT, pv_words, full)
-            _replace_para_text(para, new_full)
+        # Обрабатываем блок "Основание:"
+        if full_normalized.startswith("Основание:"):
+            para.text = ""
+            run = para.add_run(f"Основание: {osnov}")
+            run.font.size = Pt(8)
+            continue
+            
+        # Обрабатываем правое основание (где нет слова Основание, но есть маркеры ДКП/VIN)
+        if ("дкп" in full_normalized.lower() or "vin" in full_normalized.lower()) and "кассир" not in full_normalized.lower():
+            para.text = ""
+            run = para.add_run(osnov)
+            run.font.size = Pt(8)
             continue
 
-        if re.search(_DATE_PAT, full) and ("от" in full.lower() or "дата" in full.lower() or "20.06.2026" in full):
-            if "основание" not in full.lower():
-                new_full = re.sub(_DATE_PAT, date, full)
-                _replace_para_text(para, new_full)
-                continue
-
-        if re.search(_AMOUNT_PAT, full) and any(m in full.lower() for m in ["сумма", "оплата", "в размере", "всего"]):
-            new_full = re.sub(_AMOUNT_PAT, pv_str, full)
-            _replace_para_text(para, new_full)
+        # Меняем пропись суммы (Принято от... / Сумма прописью)
+        if re.search(W_PAT, full_normalized) and any(m in full_normalized.lower() for m in ["принято", "сумма", "руб"]):
+            clean_full = re.sub(W_PAT, pv_words, full_normalized)
+            para.text = ""
+            run = para.add_run(clean_full)
+            run.font.size = Pt(8)
             continue
 
+        # Меняем дату ордера
+        if re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", full_normalized) and ("от" in full_normalized.lower() or "дата" in full_normalized.lower()):
+            clean_full = re.sub(r"\b\d{2}\.\d{2}\.\d{4}\b", date, full_normalized)
+            para.text = ""
+            run = para.add_run(clean_full)
+            run.font.size = Pt(8)
+            continue
+
+        # Меняем отдельно стоящие цифры суммы (например, справа "Сумма 600 000,00")
+        if re.search(A_PAT, full_normalized) and "сумма" in full_normalized.lower():
+            clean_full = re.sub(A_PAT, pv_str, full_normalized)
+            para.text = ""
+            run = para.add_run(clean_full)
+            run.font.size = Pt(8)
+            continue
+
+    # 2. Теперь жестко чистим ячейки таблиц (включая Дебет/Кредит/Сумма слева)
     for tbl in doc.tables:
         for row in tbl.rows:
             for cell in row.cells:
-                cell_text = cell.text.strip()
-                if re.match(r"^[\d\s.,]+$", cell_text) and re.search(_AMOUNT_PAT, cell_text):
-                    for para in cell.paragraphs:
-                        _replace_para_text(para, pv_str)
+                # Собираем текст из ячейки, удаляя лишние пробелы
+                cell_text = "".join(r.text for para in cell.paragraphs for r in para.runs)
+                cell_text_clean = re.sub(r"\s+", " ", cell_text).strip()
+                
+                # Ищем любую сумму в формате цифр с копейками (включая 428 000,00)
+                if re.search(A_PAT, cell_text_clean):
+                    # Если внутри ячейки есть текст "НДС", зануляем его
+                    if "ндс" in cell_text_clean.lower():
+                        for para in cell.paragraphs:
+                            para.text = ""
+                            run = para.add_run("Без НДС")
+                            run.font.size = Pt(8)
+                    else:
+                        # Иначе это ячейка с суммой (левая или правая) — ставим ПВ
+                        for para in cell.paragraphs:
+                            para.text = ""
+                            run = para.add_run(pv_str)
+                            run.font.size = Pt(8)
 
     return doc
 
