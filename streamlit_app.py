@@ -4,8 +4,7 @@ Fresh Auto - Генератор документов с искусственны
 """
 
 import streamlit as st
-import json, os, re, subprocess, sys
-from pathlib import Path
+import re, sys, subprocess
 from datetime import datetime
 import base64
 from io import BytesIO
@@ -14,7 +13,6 @@ try:
     from docx import Document
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
-    from docx.text.paragraph import Paragraph
     import num2words as nw
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install",
@@ -22,7 +20,6 @@ except ImportError:
     from docx import Document
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
-    from docx.text.paragraph import Paragraph
     import num2words as nw
 
 # ==============================================================================
@@ -30,7 +27,6 @@ except ImportError:
 # ==============================================================================
 
 def _rub_word(n: int) -> str:
-    """Правильное склонение слова 'рубль'"""
     n100, n10 = n % 100, n % 10
     if 11 <= n100 <= 19:
         return "рублей"
@@ -41,13 +37,11 @@ def _rub_word(n: int) -> str:
     return "рублей"
 
 def format_amount(amount: float) -> str:
-    """2138000 -> '2 138 000,00'"""
     rub = int(amount)
     kop = round((amount - rub) * 100)
     return f"{rub:,}".replace(",", " ") + f",{kop:02d}"
 
 def amount_to_words(amount: float) -> str:
-    """2138000 -> 'Два миллиона сто тридцать восемь тысяч рублей 00 копеек'"""
     rub = int(amount)
     kop = round((amount - rub) * 100)
     words = nw.num2words(rub, lang="ru")
@@ -55,7 +49,6 @@ def amount_to_words(amount: float) -> str:
     return f"{words} {_rub_word(rub)} {kop:02d} копеек"
 
 def parse_amount(text: str) -> float:
-    """'2 000 000,00' или '2000000' -> 2000000.0"""
     if not text:
         return 0.0
     cleaned = re.sub(r"[^\d,.]", "", text.strip())
@@ -69,11 +62,10 @@ def parse_amount(text: str) -> float:
         return 0.0
 
 # ==============================================================================
-# РАБОТА С DOCX - НИЗКОУРОВНЕВЫЕ УТИЛИТЫ
+# РАБОТА С DOCX
 # ==============================================================================
 
 def _iter_paragraphs(doc: Document):
-    """Все параграфы: тело + таблицы + колонтитулы"""
     yield from doc.paragraphs
     for tbl in doc.tables:
         for row in tbl.rows:
@@ -89,36 +81,28 @@ def _iter_paragraphs(doc: Document):
                             yield from cell.paragraphs
 
 def _para_text(para) -> str:
-    """Полный текст параграфа из всех runs"""
     return "".join(r.text for r in para.runs)
 
-# Паттерны для сумм
 _AMOUNT_PAT = r"\d[\d\s]*\d[,.]\d{2}"
 _WORDS_PAT = (r"[А-ЯЁ][а-яёА-ЯЁ\s]+"
               r"(?:тысяч|миллион|миллиард)[а-яё\s]*"
               r"(?:рубл[а-яё]+)\s+\d{2}\s+копеек")
+_DATE_PAT = r"\b\d{2}\.\d{2}\.\d{4}\b"
 
 def _remove_nds(text: str) -> str:
-    """Убирает все упоминания НДС из строки"""
     text = re.sub(r",?\s*в\s+т\.?\s*ч\.?\s*НДС[^.;\n]*", "", text)
     text = re.sub(r"(22/122%?)\s*[\d\s,]+руб\.?", "", text)
     text = re.sub(r"НДС\s*(22/122%?)\s*[\d\s,]+руб\.?", "без НДС", text)
     return text
 
-# ==============================================================================
-# ПАРСИНГ СЧЁТА №1
-# ==============================================================================
-
 def extract_invoice_data(doc: Document) -> dict:
-    """Извлекает данные из Счёта №1 для авто-заполнения полей"""
     data = {}
-
+    
     for para in _iter_paragraphs(doc):
         t = para.text.strip()
-
+        
         m = re.search(
-            r"[Пп]родажа\s+[тТ][/\\][сС]\s+№\s*([\w\-/]+).*?от\s+(\d{2}\.\d{2}\.(?:\d{2}|\d{4}))",
-            t)
+            r"[Пп]родажа\s+[тТ][/\\][сС]\s+№\s*([\w\-/]+).*?от\s+(\d{2}\.\d{2}\.(?:\d{2}|\d{4}))", t)
         if m and "dkp_number" not in data:
             data["dkp_number"] = m.group(1).strip()
             d = m.group(2)
@@ -126,36 +110,34 @@ def extract_invoice_data(doc: Document) -> dict:
             if len(parts[2]) == 2:
                 parts[2] = "20" + parts[2]
             data["date"] = ".".join(parts)
-
+        
         m = re.search(
-            r"[Пп]окупатель[:\s]+(?:ИНН\s+\d+[,\s]+)?([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)",
-            t)
+            r"[Пп]окупатель[:\s]+(?:ИНН\s+\d+[,\s]+)?([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)", t)
         if m and "buyer_name" not in data:
             data["buyer_name"] = m.group(1).strip()
-
+        
         m = re.search(
-            r"([A-Z]{2,}\s+[A-Z]{2,})\s+([а-яё]+)\s+№\s*([A-ZА-ЯЁa-zA-Zа-яё0-9]+)\s+VIN\s+([A-Z0-9]{17})",
-            t)
+            r"([A-Z]{2,}\s+[A-Z]{2,})\s+([а-яё]+)\s+№\s*([A-ZА-ЯЁa-zA-Zа-яё0-9]+)\s+VIN\s+([A-Z0-9]{17})", t)
         if m and "car_vin" not in data:
             data["car_brand"] = m.group(1).strip()
             data["car_color"] = m.group(2).strip()
             data["car_reg"] = m.group(3).strip()
             data["car_vin"] = m.group(4).strip()
-
+    
     for tbl in doc.tables:
         for row in tbl.rows:
             row_text = " ".join(c.text.strip() for c in row.cells)
-
+            
             if "car_vin" not in data:
                 m = re.search(r"VIN\s+([A-Z0-9]{17})", row_text)
                 if m:
                     data["car_vin"] = m.group(1)
-
+            
             if "car_brand" not in data:
                 m = re.search(r"([A-Z]{2,}\s+[A-Z]{2,})", row_text)
                 if m:
                     data["car_brand"] = m.group(1)
-
+            
             if "car_color" not in data:
                 m = re.search(
                     r"\b(серый|белый|чёрный|черный|синий|красный|серебристый"
@@ -163,30 +145,24 @@ def extract_invoice_data(doc: Document) -> dict:
                     row_text, re.IGNORECASE)
                 if m:
                     data["car_color"] = m.group(1).lower()
-
+            
             if "car_reg" not in data:
                 m = re.search(r"№\s*([A-ZА-ЯЁ]{1,2}\d{3}[A-ZА-ЯЁ]{2}\d{2,3})", row_text)
                 if m:
                     data["car_reg"] = m.group(1)
-
+    
     return data
 
-# ==============================================================================
-# ОБРАБОТКА ДОКУМЕНТОВ
-# ==============================================================================
-
 def process_dkp(doc: Document, p: dict) -> Document:
-    """Обработка ДКП"""
     new_price = p["new_price"]
     pv_amount = p["pv_amount"]
     new_str = format_amount(new_price)
     new_words = amount_to_words(new_price)
     pv_str = format_amount(pv_amount)
     pv_words = amount_to_words(pv_amount)
-
+    
     pv_para_found = False
-
-    # Собираем ВСЕ параграфы
+    
     all_paragraphs = []
     
     for para in doc.paragraphs:
@@ -218,32 +194,69 @@ def process_dkp(doc: Document, p: dict) -> Document:
                     for cell in row.cells:
                         for para in cell.paragraphs:
                             all_paragraphs.append(para)
-
-    # Обрабатываем все параграфы
+    
     for para in all_paragraphs:
         full = _para_text(para)
         if not full.strip():
             continue
-
+        
+        has_date = re.search(_DATE_PAT, full)
         has_amount = re.search(_AMOUNT_PAT, full)
         has_words = re.search(_WORDS_PAT, full)
         
+        if has_amount and has_date:
+            text_without_dates = re.sub(_DATE_PAT, "", full)
+            has_amount = re.search(_AMOUNT_PAT, text_without_dates)
+        
         if has_amount and has_words:
-            new_full = re.sub(_AMOUNT_PAT, new_str, full)
-            new_full = re.sub(_WORDS_PAT, new_words, new_full)
+            new_full = full
             new_full = _remove_nds(new_full)
+            parts = re.split(f"({_DATE_PAT})", new_full)
+            result_parts = []
+            for part in parts:
+                if re.match(_DATE_PAT, part):
+                    result_parts.append(part)
+                else:
+                    part = re.sub(_AMOUNT_PAT, new_str, part)
+                    part = re.sub(_WORDS_PAT, new_words, part)
+                    result_parts.append(part)
+            new_full = "".join(result_parts)
+            
             if new_full != full and para.runs:
                 para.runs[0].text = new_full
                 for r in para.runs[1:]:
                     r.text = ""
                     
         elif has_amount and not has_words:
-            if "первоначальный взнос" in full.lower():
-                new_full = re.sub(_AMOUNT_PAT, pv_str, full)
+            text_without_dates = re.sub(_DATE_PAT, "", full)
+            if not re.search(_AMOUNT_PAT, text_without_dates):
+                continue
+                
+            new_full = full
+            new_full = _remove_nds(new_full)
+            
+            if "первоначальный взнос" in new_full.lower():
+                parts = re.split(f"({_DATE_PAT})", new_full)
+                result_parts = []
+                for part in parts:
+                    if re.match(_DATE_PAT, part):
+                        result_parts.append(part)
+                    else:
+                        part = re.sub(_AMOUNT_PAT, pv_str, part)
+                        result_parts.append(part)
+                new_full = "".join(result_parts)
                 pv_para_found = True
             else:
-                new_full = re.sub(_AMOUNT_PAT, new_str, full)
-            new_full = _remove_nds(new_full)
+                parts = re.split(f"({_DATE_PAT})", new_full)
+                result_parts = []
+                for part in parts:
+                    if re.match(_DATE_PAT, part):
+                        result_parts.append(part)
+                    else:
+                        part = re.sub(_AMOUNT_PAT, new_str, part)
+                        result_parts.append(part)
+                new_full = "".join(result_parts)
+            
             if new_full != full and para.runs:
                 para.runs[0].text = new_full
                 for r in para.runs[1:]:
@@ -292,7 +305,6 @@ def process_dkp(doc: Document, p: dict) -> Document:
     return doc
 
 def process_pko(doc: Document, p: dict) -> Document:
-    """Обработка ПКО"""
     pv_str = format_amount(p["pv_amount"])
     pv_words = amount_to_words(p["pv_amount"])
     date = p["date"]
@@ -312,7 +324,7 @@ def process_pko(doc: Document, p: dict) -> Document:
                 for r in para.runs[1:]: r.text = ""
             continue
 
-        if re.search(_WORDS_PAT, full):
+        if re.search(_WORDS_PAT, full) and not re.search(_DATE_PAT, full):
             new_full = re.sub(_WORDS_PAT, pv_words, full)
             if new_full != full and para.runs:
                 para.runs[0].text = new_full
@@ -328,15 +340,15 @@ def process_pko(doc: Document, p: dict) -> Document:
                 for r in para.runs[1:]: r.text = ""
             continue
 
-        if re.search(_AMOUNT_PAT, full) and not re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", full):
+        if re.search(_AMOUNT_PAT, full) and not re.search(_DATE_PAT, full):
             new_full = re.sub(_AMOUNT_PAT, pv_str, full)
             if new_full != full and para.runs:
                 para.runs[0].text = new_full
                 for r in para.runs[1:]: r.text = ""
             continue
 
-        if re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", full):
-            new_full = re.sub(r"\b\d{2}\.\d{2}\.\d{4}\b", date, full)
+        if re.search(_DATE_PAT, full):
+            new_full = re.sub(_DATE_PAT, date, full)
             if new_full != full and para.runs:
                 para.runs[0].text = new_full
                 for r in para.runs[1:]: r.text = ""
@@ -352,7 +364,6 @@ def process_pko(doc: Document, p: dict) -> Document:
     return doc
 
 def process_invoice(doc: Document, p: dict, amount: float) -> Document:
-    """Обработка счёта"""
     amt_str = format_amount(amount)
     amt_words = amount_to_words(amount)
     date = p["date"]
@@ -401,7 +412,7 @@ def process_invoice(doc: Document, p: dict, amount: float) -> Document:
         full = _para_text(para)
         new_full = full
 
-        new_full = re.sub(r"\b\d{2}\.\d{2}\.(?:\d{2}|\d{4})\b", date, new_full)
+        new_full = re.sub(_DATE_PAT, date, new_full)
 
         if re.search(_WORDS_PAT, new_full):
             new_full = re.sub(_WORDS_PAT, amt_words, new_full)
@@ -422,7 +433,6 @@ def process_invoice(doc: Document, p: dict, amount: float) -> Document:
 # ==============================================================================
 
 def get_binary_file_downloader_html(bin_data, file_label='File'):
-    """Генерация ссылки для скачивания"""
     b64 = base64.b64encode(bin_data).decode()
     return f'<a href="data:application/octet-stream;base64,{b64}" download="{file_label}">Скачать {file_label}</a>'
 
@@ -439,18 +449,26 @@ def main():
     # Инициализация session_state
     if 'uploaded_files' not in st.session_state:
         st.session_state.uploaded_files = {}
-    if 'form_data' not in st.session_state:
-        st.session_state.form_data = {
-            'buyer_name': '',
-            'dkp_number': '',
-            'date': datetime.today().strftime("%d.%m.%Y"),
-            'car_brand': '',
-            'car_vin': '',
-            'car_color': '',
-            'car_reg': '',
-            'real_price': '',
-            'pv_amount': ''
-        }
+    
+    # Инициализация ключей для полей, если их нет
+    if 'buyer_name_val' not in st.session_state:
+        st.session_state.buyer_name_val = ''
+    if 'dkp_number_val' not in st.session_state:
+        st.session_state.dkp_number_val = ''
+    if 'date_val' not in st.session_state:
+        st.session_state.date_val = datetime.today().strftime("%d.%m.%Y")
+    if 'car_brand_val' not in st.session_state:
+        st.session_state.car_brand_val = ''
+    if 'car_vin_val' not in st.session_state:
+        st.session_state.car_vin_val = ''
+    if 'car_color_val' not in st.session_state:
+        st.session_state.car_color_val = ''
+    if 'car_reg_val' not in st.session_state:
+        st.session_state.car_reg_val = ''
+    if 'real_price_val' not in st.session_state:
+        st.session_state.real_price_val = ''
+    if 'pv_amount_val' not in st.session_state:
+        st.session_state.pv_amount_val = ''
 
     # Боковая панель
     with st.sidebar:
@@ -484,42 +502,19 @@ def main():
     with col1:
         st.header(":clipboard: Данные сделки")
 
-        buyer_name = st.text_input("ФИО покупателя",
-                                  value=st.session_state.form_data['buyer_name'],
-                                  key='buyer_name_input')
-        dkp_number = st.text_input("Номер ДКП",
-                                   value=st.session_state.form_data['dkp_number'],
-                                   key='dkp_number_input',
-                                   disabled=True)
-        date = st.text_input("Дата документов",
-                            value=st.session_state.form_data['date'],
-                            key='date_input')
-        car_brand = st.text_input("Марка / Модель",
-                                 value=st.session_state.form_data['car_brand'],
-                                 key='car_brand_input',
-                                 disabled=True)
-        car_vin = st.text_input("VIN",
-                               value=st.session_state.form_data['car_vin'],
-                               key='car_vin_input',
-                               disabled=True)
-        car_color = st.text_input("Цвет",
-                                 value=st.session_state.form_data['car_color'],
-                                 key='car_color_input',
-                                 disabled=True)
-        car_reg = st.text_input("Гос. номер",
-                               value=st.session_state.form_data['car_reg'],
-                               key='car_reg_input',
-                               disabled=True)
+        buyer_name = st.text_input("ФИО покупателя", key='buyer_name_val')
+        dkp_number = st.text_input("Номер ДКП", key='dkp_number_val', disabled=True)
+        date = st.text_input("Дата документов", key='date_val')
+        car_brand = st.text_input("Марка / Модель", key='car_brand_val', disabled=True)
+        car_vin = st.text_input("VIN", key='car_vin_val', disabled=True)
+        car_color = st.text_input("Цвет", key='car_color_val', disabled=True)
+        car_reg = st.text_input("Гос. номер", key='car_reg_val', disabled=True)
 
     with col2:
         st.header(":moneybag: Суммы")
 
-        real_price_str = st.text_input("Реальная цена авто (руб.)",
-                                      value=st.session_state.form_data['real_price'],
-                                      key='real_price_input')
-        pv_amount_str = st.text_input("Сумма искусственного ПВ (руб.)",
-                                     value=st.session_state.form_data['pv_amount'],
-                                     key='pv_amount_input')
+        real_price_str = st.text_input("Реальная цена авто (руб.)", key='real_price_val')
+        pv_amount_str = st.text_input("Сумма искусственного ПВ (руб.)", key='pv_amount_val')
 
         try:
             real_price = parse_amount(real_price_str) if real_price_str else 0
@@ -540,25 +535,25 @@ def main():
 
                 updates = []
                 if data.get('buyer_name'):
-                    st.session_state.form_data['buyer_name'] = data['buyer_name']
+                    st.session_state.buyer_name_val = data['buyer_name']
                     updates.append("ФИО")
                 if data.get('dkp_number'):
-                    st.session_state.form_data['dkp_number'] = data['dkp_number']
+                    st.session_state.dkp_number_val = data['dkp_number']
                     updates.append("Номер ДКП")
                 if data.get('date'):
-                    st.session_state.form_data['date'] = data['date']
+                    st.session_state.date_val = data['date']
                     updates.append("Дата")
                 if data.get('car_brand'):
-                    st.session_state.form_data['car_brand'] = data['car_brand']
+                    st.session_state.car_brand_val = data['car_brand']
                     updates.append("Марка")
                 if data.get('car_vin'):
-                    st.session_state.form_data['car_vin'] = data['car_vin']
+                    st.session_state.car_vin_val = data['car_vin']
                     updates.append("VIN")
                 if data.get('car_color'):
-                    st.session_state.form_data['car_color'] = data['car_color']
+                    st.session_state.car_color_val = data['car_color']
                     updates.append("Цвет")
                 if data.get('car_reg'):
-                    st.session_state.form_data['car_reg'] = data['car_reg']
+                    st.session_state.car_reg_val = data['car_reg']
                     updates.append("Гос.номер")
 
                 if updates:
@@ -581,9 +576,9 @@ def main():
             errors.append("Не загружен файл: Счёт №1")
         if 'inv2' not in st.session_state.uploaded_files:
             errors.append("Не загружен файл: Счёт №2")
-        if not buyer_name.strip():
+        if not st.session_state.buyer_name_val.strip():
             errors.append("Не заполнено ФИО покупателя")
-        if not date.strip():
+        if not st.session_state.date_val.strip():
             errors.append("Не заполнена дата")
         if real_price <= 0:
             errors.append("Укажите реальную цену авто")
@@ -596,20 +591,20 @@ def main():
         else:
             total = real_price + pv_amount
             params = {
-                "buyer_name": buyer_name.strip(),
-                "dkp_number": dkp_number.strip(),
-                "date": date.strip(),
-                "car_brand": car_brand.strip(),
-                "car_vin": car_vin.strip(),
-                "car_color": car_color.strip(),
-                "car_reg": car_reg.strip(),
+                "buyer_name": st.session_state.buyer_name_val.strip(),
+                "dkp_number": st.session_state.dkp_number_val.strip(),
+                "date": st.session_state.date_val.strip(),
+                "car_brand": st.session_state.car_brand_val.strip(),
+                "car_vin": st.session_state.car_vin_val.strip(),
+                "car_color": st.session_state.car_color_val.strip(),
+                "car_reg": st.session_state.car_reg_val.strip(),
                 "real_price": real_price,
                 "pv_amount": pv_amount,
                 "new_price": total,
             }
 
-            surname = (buyer_name.strip().split() or ["Клиент"])[0]
-            date_safe = date.replace(".", "-")
+            surname = (st.session_state.buyer_name_val.strip().split() or ["Клиент"])[0]
+            date_safe = st.session_state.date_val.replace(".", "-")
 
             tasks = [
                 ("dkp", f"ДКП_{surname}_{date_safe}.docx", process_dkp),
