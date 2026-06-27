@@ -446,29 +446,46 @@ def main():
     st.title(":car: Fresh Auto - Генератор документов с ПВ")
     st.markdown("Автоматическое заполнение ДКП, ПКО и счетов при кредитных сделках")
 
-    # Инициализация session_state
+    # Инициализация session_state для файлов
     if 'uploaded_files' not in st.session_state:
         st.session_state.uploaded_files = {}
     
-    # Инициализация ключей для полей, если их нет
-    if 'buyer_name_val' not in st.session_state:
-        st.session_state.buyer_name_val = ''
-    if 'dkp_number_val' not in st.session_state:
-        st.session_state.dkp_number_val = ''
-    if 'date_val' not in st.session_state:
-        st.session_state.date_val = datetime.today().strftime("%d.%m.%Y")
-    if 'car_brand_val' not in st.session_state:
-        st.session_state.car_brand_val = ''
-    if 'car_vin_val' not in st.session_state:
-        st.session_state.car_vin_val = ''
-    if 'car_color_val' not in st.session_state:
-        st.session_state.car_color_val = ''
-    if 'car_reg_val' not in st.session_state:
-        st.session_state.car_reg_val = ''
-    if 'real_price_val' not in st.session_state:
-        st.session_state.real_price_val = ''
-    if 'pv_amount_val' not in st.session_state:
-        st.session_state.pv_amount_val = ''
+    # Используем колбэк для авто-заполнения
+    def auto_fill():
+        if 'inv1' in st.session_state.uploaded_files:
+            try:
+                doc = Document(BytesIO(st.session_state.uploaded_files['inv1']))
+                data = extract_invoice_data(doc)
+                
+                updates = []
+                if data.get('buyer_name'):
+                    st.session_state.buyer_name = data['buyer_name']
+                    updates.append("ФИО")
+                if data.get('dkp_number'):
+                    st.session_state.dkp_number = data['dkp_number']
+                    updates.append("Номер ДКП")
+                if data.get('date'):
+                    st.session_state.date = data['date']
+                    updates.append("Дата")
+                if data.get('car_brand'):
+                    st.session_state.car_brand = data['car_brand']
+                    updates.append("Марка")
+                if data.get('car_vin'):
+                    st.session_state.car_vin = data['car_vin']
+                    updates.append("VIN")
+                if data.get('car_color'):
+                    st.session_state.car_color = data['car_color']
+                    updates.append("Цвет")
+                if data.get('car_reg'):
+                    st.session_state.car_reg = data['car_reg']
+                    updates.append("Гос.номер")
+                
+                if updates:
+                    st.success(f"✅ Заполнено полей: {', '.join(updates)}")
+                else:
+                    st.warning("Не удалось извлечь данные из счёта")
+            except Exception as e:
+                st.error(f"Ошибка парсинга: {e}")
 
     # Боковая панель
     with st.sidebar:
@@ -502,19 +519,39 @@ def main():
     with col1:
         st.header(":clipboard: Данные сделки")
 
-        buyer_name = st.text_input("ФИО покупателя", key='buyer_name_val')
-        dkp_number = st.text_input("Номер ДКП", key='dkp_number_val', disabled=True)
-        date = st.text_input("Дата документов", key='date_val')
-        car_brand = st.text_input("Марка / Модель", key='car_brand_val', disabled=True)
-        car_vin = st.text_input("VIN", key='car_vin_val', disabled=True)
-        car_color = st.text_input("Цвет", key='car_color_val', disabled=True)
-        car_reg = st.text_input("Гос. номер", key='car_reg_val', disabled=True)
+        # Инициализация значений по умолчанию
+        if 'buyer_name' not in st.session_state:
+            st.session_state.buyer_name = ''
+        if 'dkp_number' not in st.session_state:
+            st.session_state.dkp_number = ''
+        if 'date' not in st.session_state:
+            st.session_state.date = datetime.today().strftime("%d.%m.%Y")
+        if 'car_brand' not in st.session_state:
+            st.session_state.car_brand = ''
+        if 'car_vin' not in st.session_state:
+            st.session_state.car_vin = ''
+        if 'car_color' not in st.session_state:
+            st.session_state.car_color = ''
+        if 'car_reg' not in st.session_state:
+            st.session_state.car_reg = ''
+        if 'real_price' not in st.session_state:
+            st.session_state.real_price = ''
+        if 'pv_amount' not in st.session_state:
+            st.session_state.pv_amount = ''
+
+        buyer_name = st.text_input("ФИО покупателя", key='buyer_name')
+        dkp_number = st.text_input("Номер ДКП", key='dkp_number', disabled=True)
+        date = st.text_input("Дата документов", key='date')
+        car_brand = st.text_input("Марка / Модель", key='car_brand', disabled=True)
+        car_vin = st.text_input("VIN", key='car_vin', disabled=True)
+        car_color = st.text_input("Цвет", key='car_color', disabled=True)
+        car_reg = st.text_input("Гос. номер", key='car_reg', disabled=True)
 
     with col2:
         st.header(":moneybag: Суммы")
 
-        real_price_str = st.text_input("Реальная цена авто (руб.)", key='real_price_val')
-        pv_amount_str = st.text_input("Сумма искусственного ПВ (руб.)", key='pv_amount_val')
+        real_price_str = st.text_input("Реальная цена авто (руб.)", key='real_price')
+        pv_amount_str = st.text_input("Сумма искусственного ПВ (руб.)", key='pv_amount')
 
         try:
             real_price = parse_amount(real_price_str) if real_price_str else 0
@@ -526,43 +563,11 @@ def main():
         except:
             pass
 
-    # Авто-заполнение
+    # Кнопка авто-заполнения
     if 'inv1' in st.session_state.uploaded_files:
-        if st.button(":arrows_counterclockwise: Авто-заполнить из Счёта №1", use_container_width=True):
-            try:
-                doc = Document(BytesIO(st.session_state.uploaded_files['inv1']))
-                data = extract_invoice_data(doc)
-
-                updates = []
-                if data.get('buyer_name'):
-                    st.session_state.buyer_name_val = data['buyer_name']
-                    updates.append("ФИО")
-                if data.get('dkp_number'):
-                    st.session_state.dkp_number_val = data['dkp_number']
-                    updates.append("Номер ДКП")
-                if data.get('date'):
-                    st.session_state.date_val = data['date']
-                    updates.append("Дата")
-                if data.get('car_brand'):
-                    st.session_state.car_brand_val = data['car_brand']
-                    updates.append("Марка")
-                if data.get('car_vin'):
-                    st.session_state.car_vin_val = data['car_vin']
-                    updates.append("VIN")
-                if data.get('car_color'):
-                    st.session_state.car_color_val = data['car_color']
-                    updates.append("Цвет")
-                if data.get('car_reg'):
-                    st.session_state.car_reg_val = data['car_reg']
-                    updates.append("Гос.номер")
-
-                if updates:
-                    st.success(f"✅ Заполнено полей: {', '.join(updates)}")
-                    st.rerun()
-                else:
-                    st.warning("Не удалось извлечь данные из счёта")
-            except Exception as e:
-                st.error(f"Ошибка парсинга: {e}")
+        st.button(":arrows_counterclockwise: Авто-заполнить из Счёта №1", 
+                 on_click=auto_fill, 
+                 use_container_width=True)
 
     # Генерация
     st.markdown("---")
@@ -576,10 +581,14 @@ def main():
             errors.append("Не загружен файл: Счёт №1")
         if 'inv2' not in st.session_state.uploaded_files:
             errors.append("Не загружен файл: Счёт №2")
-        if not st.session_state.buyer_name_val.strip():
+        if not st.session_state.buyer_name.strip():
             errors.append("Не заполнено ФИО покупателя")
-        if not st.session_state.date_val.strip():
+        if not st.session_state.date.strip():
             errors.append("Не заполнена дата")
+        
+        real_price = parse_amount(st.session_state.real_price)
+        pv_amount = parse_amount(st.session_state.pv_amount)
+        
         if real_price <= 0:
             errors.append("Укажите реальную цену авто")
         if pv_amount <= 0:
@@ -591,20 +600,20 @@ def main():
         else:
             total = real_price + pv_amount
             params = {
-                "buyer_name": st.session_state.buyer_name_val.strip(),
-                "dkp_number": st.session_state.dkp_number_val.strip(),
-                "date": st.session_state.date_val.strip(),
-                "car_brand": st.session_state.car_brand_val.strip(),
-                "car_vin": st.session_state.car_vin_val.strip(),
-                "car_color": st.session_state.car_color_val.strip(),
-                "car_reg": st.session_state.car_reg_val.strip(),
+                "buyer_name": st.session_state.buyer_name.strip(),
+                "dkp_number": st.session_state.dkp_number.strip(),
+                "date": st.session_state.date.strip(),
+                "car_brand": st.session_state.car_brand.strip(),
+                "car_vin": st.session_state.car_vin.strip(),
+                "car_color": st.session_state.car_color.strip(),
+                "car_reg": st.session_state.car_reg.strip(),
                 "real_price": real_price,
                 "pv_amount": pv_amount,
                 "new_price": total,
             }
 
-            surname = (st.session_state.buyer_name_val.strip().split() or ["Клиент"])[0]
-            date_safe = st.session_state.date_val.replace(".", "-")
+            surname = (st.session_state.buyer_name.strip().split() or ["Клиент"])[0]
+            date_safe = st.session_state.date.replace(".", "-")
 
             tasks = [
                 ("dkp", f"ДКП_{surname}_{date_safe}.docx", process_dkp),
