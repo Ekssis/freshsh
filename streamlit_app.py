@@ -200,11 +200,30 @@ def process_dkp(doc: Document, p: dict) -> Document:
     pv_words = amount_to_words(pv_amount)
 
     pv_para_found = False
+    price_replaced = False  # Флаг, что основная цена уже заменена
 
     for para in _iter_paragraphs(doc):
         full = _para_text(para)
 
-        if re.search(_AMOUNT_PAT, full):
+        # Сначала проверяем - если в параграфе есть и сумма цифрами, и сумма прописью
+        has_amount = re.search(_AMOUNT_PAT, full)
+        has_words = re.search(_WORDS_PAT, full)
+        
+        if has_amount and has_words:
+            # Это строка с полной суммой (например, "3 700 000,00 (Три миллиона...)"
+            # Заменяем ОБЕ суммы на правильные
+            if not price_replaced:
+                new_full = re.sub(_AMOUNT_PAT, new_str, full)
+                new_full = re.sub(_WORDS_PAT, new_words, new_full)
+                new_full = _remove_nds(new_full)
+                if new_full != full and para.runs:
+                    para.runs[0].text = new_full
+                    for r in para.runs[1:]:
+                        r.text = ""
+                price_replaced = True
+            
+        elif has_amount and not has_words:
+            # Только сумма цифрами, без прописи
             new_full = re.sub(_AMOUNT_PAT, new_str, full)
             new_full = _remove_nds(new_full)
             if new_full != full and para.runs:
@@ -212,22 +231,26 @@ def process_dkp(doc: Document, p: dict) -> Document:
                 for r in para.runs[1:]:
                     r.text = ""
 
-        elif re.search(_WORDS_PAT, full):
+        elif has_words and not has_amount:
+            # Только сумма прописью
             new_full = re.sub(_WORDS_PAT, new_words, full)
             if new_full != full and para.runs:
                 para.runs[0].text = new_full
                 for r in para.runs[1:]:
                     r.text = ""
 
-        elif re.search(r"НДС|22/122", full):
+        # Убираем НДС в строках без суммы
+        if re.search(r"НДС|22/122", full) and not has_amount and not has_words:
             new_full = _remove_nds(full)
             if new_full != full and para.runs:
                 para.runs[0].text = new_full
                 for r in para.runs[1:]:
                     r.text = ""
 
+        # Проверяем наличие пункта про ПВ
         if "первоначальный взнос" in full.lower():
             pv_para_found = True
+            # Обновляем сумму в существующем пункте
             new_full = re.sub(_AMOUNT_PAT, pv_str, full)
             new_full = re.sub(_WORDS_PAT, pv_words, new_full)
             if new_full != full and para.runs:
@@ -235,6 +258,7 @@ def process_dkp(doc: Document, p: dict) -> Document:
                 for r in para.runs[1:]:
                     r.text = ""
 
+    # Если пункта про ПВ нет - добавляем после параграфа с ценой
     if not pv_para_found:
         pv_text = (f"Первоначальный взнос по оплате цены Договора составляет "
                    f"{pv_str} руб ({pv_words}).")
