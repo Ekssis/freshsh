@@ -200,7 +200,40 @@ def process_dkp(doc: Document, p: dict) -> Document:
         if not full.strip():
             continue
         
+        # Запоминаем абзац, после которого нужно вставить ПВ, если его нет в шаблоне
         if full.strip().startswith("Цена ТС оплачивается Покупателем в течение"):
             target_payment_para = para
         
-        if any(word in full.lower() for
+        # Фильтр технической защиты (пропускаем эти пункты, чтобы не сбить лимиты гарантии)
+        if any(word in full.lower() for word in ["гаранти", "техническая защита", "лимит ответственности", "пробег"]):
+            continue
+            
+        clean_full = _remove_nds(full)
+        has_amount = re.search(_AMOUNT_PAT, clean_full)
+        has_words = re.search(_WORDS_PAT, clean_full)
+        
+        # Если пункт ПВ уже был изначально в шаблоне
+        if "первоначальный" in full.lower() or "взнос" in full.lower():
+            if has_amount:
+                clean_full = re.sub(_AMOUNT_PAT, pv_str, clean_full)
+            if has_words:
+                clean_full = re.sub(_WORDS_PAT, pv_words, clean_full)
+            _replace_para_text(para, clean_full)
+            pv_para_found = True
+        
+        # Если это основная стоимость ТС (цена договора)
+        elif any(marker in full.lower() for marker in ["цена договора", "стоимость тс", "цена тс", "стоимость автомобиля", "уплачивает покупатель"]):
+            if has_amount and has_words:
+                clean_full = re.sub(_AMOUNT_PAT, new_str, clean_full)
+                clean_full = re.sub(_WORDS_PAT, new_words, clean_full)
+                _replace_para_text(para, clean_full)
+            elif has_amount:
+                clean_full = re.sub(_AMOUNT_PAT, new_str, clean_full)
+                _replace_para_text(para, clean_full)
+
+    # Если пункта ПВ вообще не было в документе, создаем его строго ПОСЛЕ абзаца об оплате
+    if not pv_para_found and target_payment_para is not None:
+        pv_text = f"Первоначальный взнос по оплате цены Договора составляет {pv_str} руб ({pv_words})."
+        insert_paragraph_after(target_payment_para, pv_text, style_source_para=target_payment_para)
+
+    return doc
