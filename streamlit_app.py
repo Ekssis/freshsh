@@ -207,7 +207,6 @@ def process_dkp(doc: Document, p: dict) -> Document:
     pv_para_found = False
     target_payment_para = None
     
-    # Модифицированные регулярки: теперь им не важны пробелы вокруг скобок и копеек
     A_PAT = r"\b\d[\d\s]{0,12}[,.]\d{2}\b"
     W_PAT = r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+(?:тысяч|миллион|миллиард|рубл)[а-яё\s\-\,]*\d{2}\s+копеек\s*\)?"
 
@@ -234,15 +233,13 @@ def process_dkp(doc: Document, p: dict) -> Document:
             
             para.text = ""
             run = para.add_run(clean_full)
-            run.font.size = Pt(8)  
+            run.font.size = Pt(8)  # Строго 8pt
             pv_para_found = True
         
-        # 2. Корректируем пункт цены (расширили маркеры, включая "цену за тс")
+        # 2. Корректируем пункт цены договора / стоимости ТС
         elif any(marker in full_normalized.lower() for marker in ["цена договора", "стоимость тс", "цена тс", "цену за тс", "стоимость автомобиля", "уплачивает покупатель"]):
-            # Первым делом сносим НДС из нормализованной строки
             clean_full = _remove_nds(full_normalized)
             
-            # Ищем и меняем сумму / пропись с учетом гибкого паттерна копеек
             has_amt = re.search(A_PAT, clean_full)
             has_wrd = re.search(W_PAT, clean_full)
             
@@ -252,7 +249,6 @@ def process_dkp(doc: Document, p: dict) -> Document:
             elif has_amt:
                 clean_full = re.sub(A_PAT, new_str, clean_full)
             
-            # Убираем возможные двойные закрывающие скобки и зависшие запятые после сноса НДС
             clean_full = clean_full.replace(" ) )", " )").replace("))", ")")
             clean_full = re.sub(r",\s*\.", ".", clean_full)
             clean_full = re.sub(r"\s+", " ", clean_full).strip()
@@ -261,8 +257,10 @@ def process_dkp(doc: Document, p: dict) -> Document:
                 clean_full += "."
 
             para.text = ""
-            para.add_run(clean_full)
+            run = para.add_run(clean_full)
+            run.font.size = Pt(8)  # Строго 8pt для измененной цены договора
 
+    # Если пункта ПВ не было, создаем его с размером 8pt
     if not pv_para_found and target_payment_para is not None:
         pv_text = f"Первоначальный взнос по оплате цены Договора составляет {pv_str} руб ({pv_words})."
         insert_paragraph_after(target_payment_para, pv_text, style_source_para=target_payment_para)
