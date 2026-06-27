@@ -200,31 +200,88 @@ def process_dkp(doc: Document, p: dict) -> Document:
     pv_words = amount_to_words(pv_amount)
 
     pv_para_found = False
-    price_replaced = False  # Флаг, что основная цена уже заменена
 
-    for para in _iter_paragraphs(doc):
+    # Собираем ВСЕ параграфы из всех мест документа
+    all_paragraphs = []
+    
+    # Основное тело документа
+    for para in doc.paragraphs:
+        all_paragraphs.append(('body', para))
+    
+    # Таблицы в теле документа
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    all_paragraphs.append(('table', para))
+    
+    # Секции (колонтитулы, где часто находится Акт приема-передачи)
+    for section in doc.sections:
+        # Header
+        header = section.header
+        if header:
+            for para in header.paragraphs:
+                all_paragraphs.append(('header', para))
+            for tbl in header.tables:
+                for row in tbl.rows:
+                    for cell in row.cells:
+                        for para in cell.paragraphs:
+                            all_paragraphs.append(('header_table', para))
+        
+        # Footer
+        footer = section.footer
+        if footer:
+            for para in footer.paragraphs:
+                all_paragraphs.append(('footer', para))
+            for tbl in footer.tables:
+                for row in tbl.rows:
+                    for cell in row.cells:
+                        for para in cell.paragraphs:
+                            all_paragraphs.append(('footer_table', para))
+    
+    # Также проверяем текстовые рамки (text boxes) в XML
+    for elem in doc.element.iter():
+        if elem.tag.endswith('}txbxContent') or elem.tag.endswith('}txbx'):
+            # Это текстовое поле
+            from docx import Document as DocParser
+            # Обрабатываем каждый параграф внутри текстового поля
+            for para_elem in elem.iter():
+                if para_elem.tag.endswith('}p'):
+                    # Создаем параграф из элемента
+                    from docx.text.paragraph import Paragraph
+                    para = Paragraph(para_elem, None)
+                    if para.text.strip():
+                        all_paragraphs.append(('textbox', para))
+
+    # Теперь обрабатываем все собранные параграфы
+    for location, para in all_paragraphs:
         full = _para_text(para)
+        if not full.strip():
+            continue
 
-        # Сначала проверяем - если в параграфе есть и сумма цифрами, и сумма прописью
+        # Проверяем, содержит ли параграф и сумму цифрами, и сумму прописью
         has_amount = re.search(_AMOUNT_PAT, full)
         has_words = re.search(_WORDS_PAT, full)
         
         if has_amount and has_words:
-            # Это строка с полной суммой (например, "3 700 000,00 (Три миллиона...)"
-            # Заменяем ОБЕ суммы на правильные
-            if not price_replaced:
-                new_full = re.sub(_AMOUNT_PAT, new_str, full)
-                new_full = re.sub(_WORDS_PAT, new_words, new_full)
-                new_full = _remove_nds(new_full)
-                if new_full != full and para.runs:
-                    para.runs[0].text = new_full
-                    for r in para.runs[1:]:
-                        r.text = ""
-                price_replaced = True
-            
+            # Это строка с полной суммой (например, "2 138 000,00 руб (Два миллиона...)"
+            print(f"Найдена полная сумма в {location}: {full}")
+            new_full = re.sub(_AMOUNT_PAT, new_str, full)
+            new_full = re.sub(_WORDS_PAT, new_words, new_full)
+            new_full = _remove_nds(new_full)
+            if new_full != full and para.runs:
+                para.runs[0].text = new_full
+                for r in para.runs[1:]:
+                    r.text = ""
+                    
         elif has_amount and not has_words:
             # Только сумма цифрами, без прописи
-            new_full = re.sub(_AMOUNT_PAT, new_str, full)
+            if "первоначальный взнос" in full.lower():
+                # Это строка с первоначальным взносом
+                new_full = re.sub(_AMOUNT_PAT, pv_str, full)
+                pv_para_found = True
+            else:
+                new_full = re.sub(_AMOUNT_PAT, new_str, full)
             new_full = _remove_nds(new_full)
             if new_full != full and para.runs:
                 para.runs[0].text = new_full
@@ -233,7 +290,11 @@ def process_dkp(doc: Document, p: dict) -> Document:
 
         elif has_words and not has_amount:
             # Только сумма прописью
-            new_full = re.sub(_WORDS_PAT, new_words, full)
+            if "первоначальный взнос" in full.lower():
+                new_full = re.sub(_WORDS_PAT, pv_words, full)
+                pv_para_found = True
+            else:
+                new_full = re.sub(_WORDS_PAT, new_words, full)
             if new_full != full and para.runs:
                 para.runs[0].text = new_full
                 for r in para.runs[1:]:
@@ -247,18 +308,11 @@ def process_dkp(doc: Document, p: dict) -> Document:
                 for r in para.runs[1:]:
                     r.text = ""
 
-        # Проверяем наличие пункта про ПВ
+        # Проверяем наличие пункта про ПВ (отдельно)
         if "первоначальный взнос" in full.lower():
             pv_para_found = True
-            # Обновляем сумму в существующем пункте
-            new_full = re.sub(_AMOUNT_PAT, pv_str, full)
-            new_full = re.sub(_WORDS_PAT, pv_words, new_full)
-            if new_full != full and para.runs:
-                para.runs[0].text = new_full
-                for r in para.runs[1:]:
-                    r.text = ""
 
-    # Если пункта про ПВ нет - добавляем после параграфа с ценой
+    # Если пункта про ПВ нет - добавляем после первого параграфа с ценой
     if not pv_para_found:
         pv_text = (f"Первоначальный взнос по оплате цены Договора составляет "
                    f"{pv_str} руб ({pv_words}).")
@@ -277,66 +331,6 @@ def process_dkp(doc: Document, p: dict) -> Document:
                 new_p.append(new_r)
                 para._element.addnext(new_p)
                 break
-
-    return doc
-
-def process_pko(doc: Document, p: dict) -> Document:
-    """Обработка ПКО"""
-    pv_str = format_amount(p["pv_amount"])
-    pv_words = amount_to_words(p["pv_amount"])
-    date = p["date"]
-    buyer = p["buyer_name"]
-    osnov = (f"По ДКП №{p['dkp_number']} от {date} "
-             f"за а/м {p['car_brand']} {p['car_color']} "
-             f"№{p['car_reg']} VIN {p['car_vin']}")
-
-    for para in _iter_paragraphs(doc):
-        full = _para_text(para)
-        if not full.strip():
-            continue
-
-        if re.search(r"[Пп]о\s+ДКП|за\s+а/м|VIN\s+[A-Z0-9]{17}", full):
-            if para.runs:
-                para.runs[0].text = osnov
-                for r in para.runs[1:]: r.text = ""
-            continue
-
-        if re.search(_WORDS_PAT, full):
-            new_full = re.sub(_WORDS_PAT, pv_words, full)
-            if new_full != full and para.runs:
-                para.runs[0].text = new_full
-                for r in para.runs[1:]: r.text = ""
-            continue
-
-        if re.search(r"НДС|22/122", full):
-            new_full = re.sub(r"НДС\s*\(22/122%?\)[^\n]*", "Без НДС", full)
-            new_full = re.sub(r"В том числе НДС[^\n]*", "Без НДС", new_full)
-            new_full = _remove_nds(new_full)
-            if new_full != full and para.runs:
-                para.runs[0].text = new_full
-                for r in para.runs[1:]: r.text = ""
-            continue
-
-        if re.search(_AMOUNT_PAT, full) and not re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", full):
-            new_full = re.sub(_AMOUNT_PAT, pv_str, full)
-            if new_full != full and para.runs:
-                para.runs[0].text = new_full
-                for r in para.runs[1:]: r.text = ""
-            continue
-
-        if re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", full):
-            new_full = re.sub(r"\b\d{2}\.\d{2}\.\d{4}\b", date, full)
-            if new_full != full and para.runs:
-                para.runs[0].text = new_full
-                for r in para.runs[1:]: r.text = ""
-            continue
-
-        m = re.search(r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+", full)
-        if m and m.group(0) != buyer:
-            new_full = full.replace(m.group(0), buyer)
-            if new_full != full and para.runs:
-                para.runs[0].text = new_full
-                for r in para.runs[1:]: r.text = ""
 
     return doc
 
