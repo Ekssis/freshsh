@@ -208,54 +208,57 @@ def process_dkp(doc: Document, p: dict) -> Document:
     target_payment_para = None
     
     for para in doc.paragraphs:
-        # Убираем разрывы строк внутри абзаца и схлопываем множественные пробелы
-        full = _para_text(para)
+        # Собираем весь текст абзаца в одну монолитную строку
+        full = "".join(r.text for r in para.runs)
         full_normalized = re.sub(r"\s+", " ", full).strip()
         
         if not full_normalized:
             continue
         
-        # Маркер для вставки
+        # Маркер для динамической вставки ПВ
         if full_normalized.startswith("Цена ТС оплачивается Покупателем в течение"):
             target_payment_para = para
         
+        # Защита лимитов/гарантий от изменений
         if any(word in full_normalized.lower() for word in ["гаранти", "техническая защита", "лимит ответственности", "пробег"]):
             continue
 
-        # Проверяем наличие сумм и слов на нормализованном тексте
-        has_amount = re.search(_AMOUNT_PAT, full_normalized)
-        has_words = re.search(_WORDS_PAT, full_normalized)
-        
-        # 1. Если это пункт ПВ
+        # 1. Корректируем пункт с Первоначальным Взносом (если он уже есть в шаблоне)
         if "первоначальный" in full_normalized.lower() or "взнос" in full_normalized.lower():
             clean_full = full_normalized
-            if has_amount:
+            if re.search(_AMOUNT_PAT, clean_full):
                 clean_full = re.sub(_AMOUNT_PAT, pv_str, clean_full)
-            if has_words:
+            if re.search(_WORDS_PAT, clean_full):
                 clean_full = re.sub(_WORDS_PAT, pv_words, clean_full)
-            _replace_para_text(para, clean_full)
             
-            # Принудительно уменьшаем шрифт у ПВ до 8pt
-            for run in para.runs:
-                run.font.size = Pt(8)
-                
+            # Полностью пересоздаем текст в абзаце, чтобы убрать скрытые разрывы Word
+            para.text = ""
+            run = para.add_run(clean_full)
+            run.font.size = Pt(8)  # Принудительно 8pt для ПВ
             pv_para_found = True
         
-        # 2. Если это пункт цены договора
+        # 2. Корректируем пункт Основной Цены (и вырезаем НДС)
         elif any(marker in full_normalized.lower() for marker in ["цена договора", "стоимость тс", "цена тс", "стоимость автомобиля", "уплачивает покупатель"]):
-            # Удаляем НДС из текста
+            # Сначала агрессивно удаляем НДС из единой строки
             clean_full = _remove_nds(full_normalized)
             
-            # Снова ищем паттерны на очищенной от НДС строке
+            # Теперь заменяем старую цену (цифры и пропись) на новую общую сумму с ПВ
             if re.search(_AMOUNT_PAT, clean_full) and re.search(_WORDS_PAT, clean_full):
                 clean_full = re.sub(_AMOUNT_PAT, new_str, clean_full)
                 clean_full = re.sub(_WORDS_PAT, new_words, clean_full)
             elif re.search(_AMOUNT_PAT, clean_full):
                 clean_full = re.sub(_AMOUNT_PAT, new_str, clean_full)
+            
+            # Финальная зачистка артефактов
+            clean_full = clean_full.replace("( )", "").replace(" )", ")").strip()
+            if clean_full.endswith(","):
+                clean_full = clean_full[:-1].strip()
+            if not clean_full.endswith("."):
+                clean_full += "."
                 
-            # Дополнительный фикс на случай, если "руб" или скобки остались кривыми после удаления НДС
-            clean_full = clean_full.replace("( )", "").replace(" )", ")")
-            _replace_para_text(para, clean_full)
+            # Полностью заменяем внутренности абзаца на чистый текст без старых ранов Word
+            para.text = ""
+            para.add_run(clean_full)
 
     # Если пункта ПВ вообще не было в документе, создаем его строго ПОСЛЕ абзаца об оплате
     if not pv_para_found and target_payment_para is not None:
@@ -263,7 +266,6 @@ def process_dkp(doc: Document, p: dict) -> Document:
         insert_paragraph_after(target_payment_para, pv_text, style_source_para=target_payment_para)
 
     return doc
-
 def process_pko(doc: Document, p: dict) -> Document:
     pv_str = format_amount(p["pv_amount"])
     pv_words = amount_to_words(p["pv_amount"])
