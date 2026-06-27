@@ -99,7 +99,22 @@ def _replace_para_text(para, new_text):
     if style is not None:
         first_run._element.append(style)
 
-# Паттерн для поиска сумм (исключает даты вида 20.06.2026 за счет ограничения длины целой части)
+def insert_paragraph_after(paragraph, text, style_source_para=None):
+    """Безопасная вставка нового абзаца строго после текущего"""
+    new_p = OxmlElement('w:p')
+    paragraph._p.getparent().insert(paragraph._p.getparent().index(paragraph._p) + 1, new_p)
+    new_para = paragraph.__class__(new_p, paragraph._body)
+    new_para.text = text
+    
+    # Копируем стиль шрифта из предыдущего абзаца для сохранения визуала
+    if style_source_para and style_source_para.runs:
+        src_run = style_source_para.runs[0]
+        style = src_run._element.find(qn("w:rPr"))
+        if style is not None and new_para.runs:
+            new_para.runs[0]._element.append(style)
+            
+    return new_para
+
 _AMOUNT_PAT = r"\b\d[\d\s]{0,12}[,.]\d{2}\b"
 _WORDS_PAT = (r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+"
               r"(?:тысяч|миллион|миллиард|рубл)[а-яё\s\-\,]*"
@@ -147,26 +162,22 @@ def extract_invoice_data(doc: Document) -> dict:
             
             if "car_vin" not in data:
                 m = re.search(r"VIN\s*[:\s]*([A-Z0-9]{17})", row_text, re.IGNORECASE)
-                if m:
-                    data["car_vin"] = m.group(1)
+                if m: data["car_vin"] = m.group(1)
             
             if "car_brand" not in data:
                 m = re.search(r"Марка\s*[:\s]*([A-ZА-ЯЁ]{2,}\s+[A-ZА-ЯЁ0-9\s\-]+)", row_text, re.IGNORECASE)
-                if m:
-                    data["car_brand"] = m.group(1).strip()
+                if m: data["car_brand"] = m.group(1).strip()
             
             if "car_color" not in data:
                 m = re.search(
                     r"\b(серый|белый|чёрный|черный|синий|красный|серебристый"
                     r"|золотистый|коричневый|зелёный|зеленый|бежевый|жёлтый|желтый)\b",
                     row_text, re.IGNORECASE)
-                if m:
-                    data["car_color"] = m.group(1).lower()
+                if m: data["car_color"] = m.group(1).lower()
             
             if "car_reg" not in data:
                 m = re.search(r"(?:№|Гос\s*знак)\s*([A-ZА-ЯЁ]{1,2}\d{3}[A-ZА-ЯЁ]{2}\d{2,3})", row_text, re.IGNORECASE)
-                if m:
-                    data["car_reg"] = m.group(1)
+                if m: data["car_reg"] = m.group(1)
     
     return data
 
@@ -182,33 +193,49 @@ def process_dkp(doc: Document, p: dict) -> Document:
     pv_str = format_amount(pv_amount)
     pv_words = amount_to_words(pv_amount)
     
-    for para in _iter_paragraphs(doc):
+    pv_para_found = False
+    target_payment_para = None  # Сюда сохраним абзац «Цена ТС оплачивается Покупателем...»
+    
+    for para in doc.paragraphs:
         full = _para_text(para)
         if not full.strip():
             continue
         
-        # Пропускаем строки, похожие на даты или VIN
-        if re.search(r"VIN|\b\d{2}\.\d{2}\.\d{4}\b", full) and "цена" not in full.lower():
+        # Засекаем абзац, после которого нужно вставить ПВ, если его нет
+        if full.strip().startswith("Цена ТС оплачивается Покупателем в течение"):
+            target_payment_para = para
+        
+        # Фильтр технической защиты
+        if any(word in full.lower() for word in ["гаранти", "техническая защита", "лимит ответственности", "пробег"]):
             continue
             
         clean_full = _remove_nds(full)
         has_amount = re.search(_AMOUNT_PAT, clean_full)
         has_words = re.search(_WORDS_PAT, clean_full)
         
-        if "первоначальный взнос" in full.lower() or "первоначального взноса" in full.lower():
+        # Если пункт ПВ уже был в шаблоне
+        if "первоначальный" in full.lower() or "взнос" in full.lower():
             if has_amount:
                 clean_full = re.sub(_AMOUNT_PAT, pv_str, clean_full)
             if has_words:
                 clean_full = re.sub(_WORDS_PAT, pv_words, clean_full)
             _replace_para_text(para, clean_full)
-        else:
+            pv_para_found = True
+        
+        # Если это основная стоимость ТС
+        elif any(marker in full.lower() for marker in ["цена договора", "стоимость тс", "цена тс", "стоимость автомобиля", "уплачивает покупатель"]):
             if has_amount and has_words:
                 clean_full = re.sub(_AMOUNT_PAT, new_str, clean_full)
                 clean_full = re.sub(_WORDS_PAT, new_words, clean_full)
                 _replace_para_text(para, clean_full)
-            elif has_amount and ("цена" in full.lower() or "стоимость" in full.lower() or "сумма" in full.lower()):
+            elif has_amount:
                 clean_full = re.sub(_AMOUNT_PAT, new_str, clean_full)
                 _replace_para_text(para, clean_full)
+
+    # Если пункта ПВ нет в документе, создаем его строго после абзаца об оплате в течение 3 дней
+    if not pv_para_found and target_payment_para is not None:
+        pv_text = f"Первоначальный взнос по оплате цены Договора составляет {pv_str} руб ({pv_words})."
+        insert_paragraph_after(target_payment_para, pv_text, style_source_para=target_payment_para)
 
     return doc
 
@@ -226,36 +253,33 @@ def process_pko(doc: Document, p: dict) -> Document:
         if not full.strip():
             continue
 
-        # 1. Замена основания
+        if "техническая защита" in full.lower() or "лимит" in full.lower():
+            continue
+
         if re.search(r"Основание:", full, re.IGNORECASE) or (re.search(r"ДКП|а/м|VIN", full) and "кассир" not in full.lower() and "получено" not in full.lower()):
             _replace_para_text(para, f"Основание: {osnov}" if "Основание:" in full else osnov)
             continue
 
-        # 2. Сумма прописью
-        if re.search(_WORDS_PAT, full):
+        if re.search(_WORDS_PAT, full) and any(m in full.lower() for m in ["принято", "сумма", "руб"]):
             new_full = re.sub(_WORDS_PAT, pv_words, full)
             _replace_para_text(para, new_full)
             continue
 
-        # 3. Дата (меняем только если это явное поле даты, а не часть строки ДКП)
         if re.search(_DATE_PAT, full) and ("от" in full.lower() or "дата" in full.lower() or "20.06.2026" in full):
             if "основание" not in full.lower():
                 new_full = re.sub(_DATE_PAT, date, full)
                 _replace_para_text(para, new_full)
                 continue
 
-        # 4. Сумма цифрами в тексте
-        if re.search(_AMOUNT_PAT, full) and ("сумма" in full.lower() or "оплата" in full.lower() or "в размере" in full.lower()):
+        if re.search(_AMOUNT_PAT, full) and any(m in full.lower() for m in ["сумма", "оплата", "в размере", "всего"]):
             new_full = re.sub(_AMOUNT_PAT, pv_str, full)
             _replace_para_text(para, new_full)
             continue
 
-    # 5. Обработка табличных ячеек ПКО
     for tbl in doc.tables:
         for row in tbl.rows:
             for cell in row.cells:
                 cell_text = cell.text.strip()
-                # Если в ячейке исключительно сумма (или сумма с пробелами)
                 if re.match(r"^[\d\s.,]+$", cell_text) and re.search(_AMOUNT_PAT, cell_text):
                     for para in cell.paragraphs:
                         _replace_para_text(para, pv_str)
@@ -290,7 +314,6 @@ def process_invoice(doc: Document, p: dict, amount: float) -> Document:
                             if re.search(_AMOUNT_PAT, _para_text(para)):
                                 _replace_para_text(para, "0,00")
                     else:
-                        # Меняем только если это чисто числовое поле в таблице товаров/услуг
                         if ri > 0 and (j >= len(row.cells) - 2): 
                             for para in cell.paragraphs:
                                 if re.search(_AMOUNT_PAT, _para_text(para)):
