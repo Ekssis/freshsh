@@ -283,11 +283,17 @@ def process_dkp(doc: Document, p: dict) -> Document:
         if "первоначальный взнос" in full.lower():
             pv_para_found = True
 
+    # Если пункта про ПВ нет - добавляем ПОСЛЕ абзаца с оплатой
     if not pv_para_found:
         pv_text = (f"Первоначальный взнос по оплате цены Договора составляет "
                    f"{pv_str} руб ({pv_words}).")
+        
+        # Ищем абзац про оплату (содержит "оплачивается", "3 дней", "кассу", "расчетный счет")
+        inserted = False
         for para in doc.paragraphs:
-            if re.search(r"размере\s+" + _AMOUNT_PAT, _para_text(para)):
+            full_text = _para_text(para)
+            if re.search(r"[Оо]плачивается.*[Пп]окупателем.*(?:дней|кассу|расчетный)", full_text):
+                # Вставляем новый параграф ПОСЛЕ этого
                 new_p = OxmlElement("w:p")
                 new_r = OxmlElement("w:r")
                 if para.runs:
@@ -300,7 +306,26 @@ def process_dkp(doc: Document, p: dict) -> Document:
                 new_r.append(new_t)
                 new_p.append(new_r)
                 para._element.addnext(new_p)
+                inserted = True
                 break
+        
+        # Если не нашли абзац про оплату - вставляем после абзаца с ценой (как раньше)
+        if not inserted:
+            for para in doc.paragraphs:
+                if re.search(r"размере\s+" + _AMOUNT_PAT, _para_text(para)):
+                    new_p = OxmlElement("w:p")
+                    new_r = OxmlElement("w:r")
+                    if para.runs:
+                        rpr = para.runs[0]._r.find(qn("w:rPr"))
+                        if rpr is not None:
+                            from copy import deepcopy
+                            new_r.append(deepcopy(rpr))
+                    new_t = OxmlElement("w:t")
+                    new_t.text = pv_text
+                    new_r.append(new_t)
+                    new_p.append(new_r)
+                    para._element.addnext(new_p)
+                    break
 
     return doc
 
