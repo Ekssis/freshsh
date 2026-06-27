@@ -1,6 +1,7 @@
 """
 FRESH - Генератор документов с искусственным ПВ
-Автоматическое заполнение ДКП, ПКО и счетов при кредищих сделках
+Автоматическое заполнение ДКП, ПКО и счетов при кредитных сделках
+v3 - исправлен process_pko (замены в таблицах и параграфах)
 """
 
 import streamlit as st
@@ -63,8 +64,13 @@ def parse_amount(text: str) -> float:
         return 0.0
 
 # ==============================================================================
-# РАБОТА С DOCX
+# РАБОТА С DOCX — БАЗОВЫЕ УТИЛИТЫ
 # ==============================================================================
+
+A_PAT    = r"\b\d[\d\s]{0,12}[,.]\d{2}\b"
+W_PAT    = (r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+"
+            r"(?:тысяч|миллион|миллиард|рубл)[а-яё\s\-\,]*\d{2}\s+копеек")
+DATE_PAT = r"\b\d{2}\.\d{2}\.\d{4}\b"
 
 def _iter_paragraphs(doc: Document):
     yield from doc.paragraphs
@@ -84,66 +90,47 @@ def _iter_paragraphs(doc: Document):
 def _para_text(para) -> str:
     return "".join(r.text for r in para.runs)
 
-def _replace_para_text(para, new_text):
-    if not para.runs:
-        para.add_run(new_text)
-        return
-    if _para_text(para) == new_text:
-        return
-    
-    first_run = para.runs[0]
-    style = first_run._element.find(qn("w:rPr"))
-    
-    for r in para.runs[1:]:
-        r.text = ""
-    
-    first_run.text = new_text
-    if style is not None:
-        first_run._element.append(style)
-
-def insert_paragraph_after(paragraph, text, style_source_para=None):
-    """Вставка абзаца строго после текущего с принудительным размером шрифта 8pt"""
-    new_p = OxmlElement('w:p')
-    paragraph._p.getparent().insert(paragraph._p.getparent().index(paragraph._p) + 1, new_p)
-    new_para = paragraph.__class__(new_p, paragraph._parent)
-    
-    # Создаем раны с текстом и жестко ставим 8pt
-    run = new_para.add_run(text)
-    run.font.size = Pt(8)
-    
-    # Копируем базовые стили (шрифт Arial/Times), если они есть
-    if style_source_para and style_source_para.runs:
-        src_run = style_source_para.runs[0]
-        run.font.name = src_run.font.name
-        
-    # Настройки абзаца (чтобы не было огромных отступов)
-    new_para.paragraph_format.space_before = Pt(0)
-    new_para.paragraph_format.space_after = Pt(4)
-    new_para.paragraph_format.line_spacing = 1.0
-            
-    return new_para
-
-_AMOUNT_PAT = r"\b\d[\d\s]{0,12}[,.]\d{2}\b"
-_WORDS_PAT = (r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+"
-              r"(?:тысяч|миллион|миллиард|рубл)[а-яё\s\-\,]*"
-              r"\d{2}\s+копеек")
-_DATE_PAT = r"\b\d{2}\.\d{2}\.\d{4}\b"
+def _set_para(para, text: str):
+    """Записывает текст, сохраняя форматирование первого run"""
+    if para.runs:
+        para.runs[0].text = text
+        for r in para.runs[1:]:
+            r.text = ""
+    else:
+        para.add_run(text)
 
 def _remove_nds(text: str) -> str:
-    # Агрессивное удаление НДС с учетом возможных переносов строк и пробелов
     text = re.sub(r",?\s*в\s+т\.?\s*ч\.?\s*НДС[^.;\n]*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\(?22/122%?\)?\s*[\d\s,.]+руб\.?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"НДС\s*\(?22/122%?\)?\s*[\d\s,.]+руб\.?", "", text, flags=re.IGNORECASE)
-    # Чистим двойные пробелы в конце
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
+def insert_paragraph_after(paragraph, text, style_source_para=None):
+    """Вставка абзаца после текущего"""
+    new_p = OxmlElement('w:p')
+    paragraph._p.getparent().insert(
+        paragraph._p.getparent().index(paragraph._p) + 1, new_p)
+    new_para = paragraph.__class__(new_p, paragraph._parent)
+    run = new_para.add_run(text)
+    run.font.size = Pt(8)
+    if style_source_para and style_source_para.runs:
+        run.font.name = style_source_para.runs[0].font.name
+    new_para.paragraph_format.space_before = Pt(0)
+    new_para.paragraph_format.space_after = Pt(4)
+    new_para.paragraph_format.line_spacing = 1.0
+    return new_para
+
+# ==============================================================================
+# ПАРСИНГ СЧЁТА №1
+# ==============================================================================
+
 def extract_invoice_data(doc: Document) -> dict:
     data = {}
-    
+
     for para in _iter_paragraphs(doc):
         t = para.text.strip()
-        
+
         m = re.search(
             r"[Пп]родажа\s+[тТ][/\\][сС]\s+№\s*([\w\-/]+).*?от\s+(\d{2}\.\d{2}\.(?:\d{2}|\d{4}))", t)
         if m and "dkp_number" not in data:
@@ -153,188 +140,246 @@ def extract_invoice_data(doc: Document) -> dict:
             if len(parts[2]) == 2:
                 parts[2] = "20" + parts[2]
             data["date"] = ".".join(parts)
-        
+
         m = re.search(
             r"[Пп]окупатель[:\s]+(?:ИНН\s+\d+[,\s]+)?([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)", t)
         if m and "buyer_name" not in data:
             data["buyer_name"] = m.group(1).strip()
-            
+
         m = re.search(
-            r"([A-ZА-ЯЁ]{2,}\s+[A-ZА-ЯЁ0-9\s\-]+?)\s+([а-яё]+)\s+№\s*([A-ZА-ЯЁ0-9]+)\s+VIN\s+([A-Z0-9]{17})", t, re.IGNORECASE)
+            r"([A-ZА-ЯЁ]{2,}\s+[A-ZА-ЯЁ0-9\s\-]+?)\s+([а-яё]+)\s+№\s*([A-ZА-ЯЁ0-9]+)\s+VIN\s+([A-Z0-9]{17})",
+            t, re.IGNORECASE)
         if m and "car_vin" not in data:
             data["car_brand"] = m.group(1).strip()
             data["car_color"] = m.group(2).strip()
-            data["car_reg"] = m.group(3).strip()
-            data["car_vin"] = m.group(4).strip()
-    
+            data["car_reg"]   = m.group(3).strip()
+            data["car_vin"]   = m.group(4).strip()
+
     for tbl in doc.tables:
         for row in tbl.rows:
             row_text = " ".join(c.text.strip() for c in row.cells)
-            
+
             if "car_vin" not in data:
                 m = re.search(r"VIN\s*[:\s]*([A-Z0-9]{17})", row_text, re.IGNORECASE)
                 if m: data["car_vin"] = m.group(1)
-            
+
             if "car_brand" not in data:
-                m = re.search(r"Марка\s*[:\s]*([A-ZА-ЯЁ]{2,}\s+[A-ZА-ЯЁ0-9\s\-]+)", row_text, re.IGNORECASE)
+                m = re.search(r"([A-ZА-ЯЁ]{2,}\s+[A-ZА-ЯЁ0-9\s\-]+)", row_text)
                 if m: data["car_brand"] = m.group(1).strip()
-            
+
             if "car_color" not in data:
                 m = re.search(
                     r"\b(серый|белый|чёрный|черный|синий|красный|серебристый"
                     r"|золотистый|коричневый|зелёный|зеленый|бежевый|жёлтый|желтый)\b",
                     row_text, re.IGNORECASE)
                 if m: data["car_color"] = m.group(1).lower()
-            
+
             if "car_reg" not in data:
-                m = re.search(r"(?:№|Гос\s*знак)\s*([A-ZА-ЯЁ]{1,2}\d{3}[A-ZА-ЯЁ]{2}\d{2,3})", row_text, re.IGNORECASE)
+                m = re.search(
+                    r"(?:№|Гос\s*знак)\s*([A-ZА-ЯЁ]{1,2}\d{3}[A-ZА-ЯЁ]{2}\d{2,3})",
+                    row_text, re.IGNORECASE)
                 if m: data["car_reg"] = m.group(1)
-    
+
     return data
 
 # ==============================================================================
-# ПРОЦЕССОРЫ ДОКУМЕНТОВ
+# ПРОЦЕССОР ДКП — БЕЗ ИЗМЕНЕНИЙ (работает отлично)
 # ==============================================================================
 
 def process_dkp(doc: Document, p: dict) -> Document:
     new_price = p["new_price"]
     pv_amount = p["pv_amount"]
-    new_str = format_amount(new_price)
+    new_str   = format_amount(new_price)
     new_words = amount_to_words(new_price)
-    pv_str = format_amount(pv_amount)
-    pv_words = amount_to_words(pv_amount)
-    
-    pv_para_found = False
+    pv_str    = format_amount(pv_amount)
+    pv_words  = amount_to_words(pv_amount)
+
+    pv_para_found      = False
     target_payment_para = None
-    
-    A_PAT = r"\b\d[\d\s]{0,12}[,.]\d{2}\b"
-    W_PAT = r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+(?:тысяч|миллион|миллиард|рубл)[а-яё\s\-\,]*\d{2}\s+копеек\s*\)?"
 
     for para in doc.paragraphs:
-        full = "".join(r.text for r in para.runs)
+        full            = "".join(r.text for r in para.runs)
         full_normalized = re.sub(r"\s+", " ", full).strip()
-        
+
         if not full_normalized:
             continue
-        
+
         if full_normalized.startswith("Цена ТС оплачивается Покупателем в течение"):
             target_payment_para = para
-        
-        if any(word in full_normalized.lower() for word in ["гаранти", "техническая защита", "лимит ответственности", "пробег"]):
+
+        if any(word in full_normalized.lower() for word in
+               ["гаранти", "техническая защита", "лимит ответственности", "пробег"]):
             continue
 
-        # 1. Корректируем пункт с Первоначальным Взносом
         if "первоначальный" in full_normalized.lower() or "взнос" in full_normalized.lower():
             clean_full = full_normalized
             if re.search(A_PAT, clean_full):
                 clean_full = re.sub(A_PAT, pv_str, clean_full)
             if re.search(W_PAT, clean_full):
                 clean_full = re.sub(W_PAT, pv_words, clean_full)
-            
             para.text = ""
             run = para.add_run(clean_full)
-            run.font.size = Pt(8)  # Строго 8pt
+            run.font.size = Pt(8)
             pv_para_found = True
-        
-        # 2. Корректируем пункт цены договора / стоимости ТС
-        elif any(marker in full_normalized.lower() for marker in ["цена договора", "стоимость тс", "цена тс", "цену за тс", "стоимость автомобиля", "уплачивает покупатель"]):
+
+        elif any(marker in full_normalized.lower() for marker in
+                 ["цена договора", "стоимость тс", "цена тс", "цену за тс",
+                  "стоимость автомобиля", "уплачивает покупатель"]):
             clean_full = _remove_nds(full_normalized)
-            
             has_amt = re.search(A_PAT, clean_full)
             has_wrd = re.search(W_PAT, clean_full)
-            
             if has_amt and has_wrd:
                 clean_full = re.sub(A_PAT, new_str, clean_full)
-                clean_full = re.sub(W_PAT, new_words + " )" if ")" in has_wrd.group(0) else new_words, clean_full)
+                suffix = " )" if ")" in has_wrd.group(0) else ""
+                clean_full = re.sub(W_PAT, new_words + suffix, clean_full)
             elif has_amt:
                 clean_full = re.sub(A_PAT, new_str, clean_full)
-            
             clean_full = clean_full.replace(" ) )", " )").replace("))", ")")
             clean_full = re.sub(r",\s*\.", ".", clean_full)
             clean_full = re.sub(r"\s+", " ", clean_full).strip()
-            
             if not clean_full.endswith("."):
                 clean_full += "."
-
             para.text = ""
             run = para.add_run(clean_full)
-            run.font.size = Pt(8)  # Строго 8pt для измененной цены договора
+            run.font.size = Pt(8)
 
-    # Если пункта ПВ не было, создаем его с размером 8pt
     if not pv_para_found and target_payment_para is not None:
-        pv_text = f"Первоначальный взнос по оплате цены Договора составляет {pv_str} руб ({pv_words})."
-        insert_paragraph_after(target_payment_para, pv_text, style_source_para=target_payment_para)
+        pv_text = (f"Первоначальный взнос по оплате цены Договора составляет "
+                   f"{pv_str} руб ({pv_words}).")
+        insert_paragraph_after(target_payment_para, pv_text,
+                                style_source_para=target_payment_para)
 
     return doc
+
+# ==============================================================================
+# ПРОЦЕССОР ПКО — ПОЛНОСТЬЮ ПЕРЕПИСАН v3
+# ==============================================================================
+
 def process_pko(doc: Document, p: dict) -> Document:
-    # Ваша сумма (400 000,00) и пропись
-    pv_str = format_amount(p["pv_amount"])
+    """
+    Обрабатывает ПКО: таблицы + параграфы отдельно.
+    Меняет: сумму (цифры + пропись), дату, ФИО, основание, убирает НДС.
+    """
+    pv_str   = format_amount(p["pv_amount"])
     pv_words = amount_to_words(p["pv_amount"])
-    date = p["date"]
-    
-    # Однострочное чистое основание
-    osnov_text = (f"По ДКП №{p['dkp_number']} от {date} "
-                  f"за а/м {p['car_brand']} {p['car_color']} "
-                  f"№{p['car_reg']} VIN {p['car_vin']}")
+    date     = p["date"]
+    buyer    = p["buyer_name"]
+    osnov    = (f"По ДКП №{p['dkp_number']} от {date} "
+                f"за а/м {p['car_brand']} {p['car_color']} "
+                f"№{p['car_reg']} VIN {p['car_vin']}")
 
-    A_PAT = r"\b\d[\d\s]{0,12}[,.]\d{2}\b"
-    W_PAT = r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+(?:тысяч|миллион|миллиард|рубл)[а-яё\s\-\,]*\d{2}\s+копеек"
-
+    # ── 1. ТАБЛИЦЫ ──────────────────────────────────────────────────────────
     for tbl in doc.tables:
         for row in tbl.rows:
             for cell in row.cells:
-                for para in cell.paragraphs:
-                    txt = "".join(run.text for run in para.runs)
-                    txt_normalized = re.sub(r"\s+", " ", txt).strip()
-                    
-                    if not txt_normalized:
-                        continue
+                txt = cell.text.strip()
+                if not txt:
+                    continue
 
-                    # 1. Полностью стираем строки с НДС
-                    if "в том числе" in txt_normalized.lower() or "ндс" in txt_normalized.lower():
-                        for run in para.runs:
-                            run.text = ""
-                        para.text = "" 
-                        continue
+                # НДС строки — полностью стираем
+                if re.search(r"в том числе|ндс|22/122", txt, re.IGNORECASE):
+                    for para in cell.paragraphs:
+                        _set_para(para, "")
+                    continue
 
-                    new_text = None
+                # Основание (строка с ДКП или VIN)
+                if re.search(r"[Пп]о\s+ДКП|VIN\s+[A-Z0-9]{10,}|дкп\s+№", txt, re.IGNORECASE):
+                    for para in cell.paragraphs:
+                        if _para_text(para).strip():
+                            _set_para(para, osnov)
+                    continue
 
-                    # 2. Левое поле "Основание:"
-                    if txt_normalized.startswith("Основание:"):
-                        new_text = f"Основание: {osnov_text}"
+                # Только ячейки "Основание:" — добавляем основание рядом
+                if re.fullmatch(r"[Оо]снование\s*:?\s*", txt):
+                    # Текст основания в следующей ячейке — обработается выше
+                    continue
 
-                    # 3. Правое поле основания (где упоминается ДКП или VIN)
-                    elif ("дкп" in txt_normalized.lower() or "vin" in txt_normalized.lower()) and "кассир" not in txt_normalized.lower():
-                        new_text = osnov_text
+                # ФИО покупателя — ячейка с тремя словами с заглавными
+                fio_m = re.match(
+                    r"^([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)$",
+                    txt)
+                if fio_m:
+                    for para in cell.paragraphs:
+                        if _para_text(para).strip():
+                            _set_para(para, buyer)
+                    continue
 
-                    # 4. Меняем пропись суммы
-                    elif re.search(W_PAT, txt_normalized):
-                        new_text = re.sub(W_PAT, pv_words, txt)
 
-                    # 5. Меняем цифры суммы (в тексте и в таблице дебета/кредита)
-                    elif re.search(A_PAT, txt_normalized):
-                        new_text = re.sub(A_PAT, pv_str, txt)
+                # Сумма прописью в ячейке
+                if re.search(W_PAT, txt):
+                    for para in cell.paragraphs:
+                        if _para_text(para).strip():
+                            nf = re.sub(W_PAT, pv_words, _para_text(para))
+                            _set_para(para, nf)
+                    continue
 
-                    # Если текст подлежит замене, аккуратно внедряем его с сохранением шрифта 8pt
-                    if new_text is not None:
-                        if para.runs:
-                            # Записываем весь новый текст в первый ран
-                            para.runs[0].text = new_text
-                            para.runs[0].font.size = Pt(8)
-                            # Остальные раны в абзаце очищаем, чтобы не было дублей текста
-                            for extra_run in para.runs[1:]:
-                                extra_run.text = ""
-                        else:
-                            # Если ранов вдруг не было, создаем новый
-                            run = para.add_run(new_text)
-                            run.font.size = Pt(8)
+                # Сумма цифрами (ячейка содержит только число)
+                if re.fullmatch(r"[\s\d\s]+[,.][\d]{2}", txt.replace(" ", "").replace("\xa0", "")):
+                    for para in cell.paragraphs:
+                        if _para_text(para).strip():
+                            nf = re.sub(A_PAT, pv_str, _para_text(para))
+                            _set_para(para, nf)
+                    continue
+
+                # Дата (ячейка только с датой)
+                if re.fullmatch(DATE_PAT, txt):
+                    for para in cell.paragraphs:
+                        if _para_text(para).strip():
+                            nf = re.sub(DATE_PAT, date, _para_text(para))
+                            _set_para(para, nf)
+                    continue
+
+    # ── 2. ПАРАГРАФЫ (вне таблиц) ───────────────────────────────────────────
+    for para in doc.paragraphs:
+        full = _para_text(para)
+        ns   = full.strip()
+        if not ns:
+            continue
+
+        # НДС — убираем полностью
+        if re.search(r"в том числе|ндс|22/122", ns, re.IGNORECASE):
+            _set_para(para, "")
+            continue
+
+        # Строка прописи суммы (начинается с заглавной, содержит тысяч/миллион)
+        if re.search(W_PAT, ns):
+            nf = re.sub(W_PAT, pv_words, full)
+            if nf != full:
+                _set_para(para, nf)
+            continue
+
+        # Строка "Сумма:" с прописью
+        if re.match(r"[Сс]умма\s*:", ns) and re.search(W_PAT, ns):
+            nf = "Сумма: " + pv_words
+            _set_para(para, nf)
+            continue
+
+        # Сумма цифрами (строка только с суммой)
+        if re.fullmatch(r"\s*" + A_PAT + r"\s*", ns):
+            _set_para(para, pv_str)
+            continue
+
+        # Дата (строка только с датой)
+        if re.fullmatch(DATE_PAT, ns):
+            _set_para(para, date)
+            continue
+
+        # Дата внутри текста
+        if re.search(DATE_PAT, ns):
+            nf = re.sub(DATE_PAT, date, full)
+            if nf != full:
+                _set_para(para, nf)
 
     return doc
 
+# ==============================================================================
+# ПРОЦЕССОР СЧЁТОВ — БЕЗ ИЗМЕНЕНИЙ (работает хорошо)
+# ==============================================================================
+
 def process_invoice(doc: Document, p: dict, amount: float) -> Document:
-    amt_str = format_amount(amount)
+    amt_str   = format_amount(amount)
     amt_words = amount_to_words(amount)
-    date = p["date"]
+    date      = p["date"]
 
     for tbl in doc.tables:
         nds_sum_col = -1
@@ -350,36 +395,36 @@ def process_invoice(doc: Document, p: dict, amount: float) -> Document:
 
                 if re.search(r"22/122", ct):
                     for para in cell.paragraphs:
-                        new_f = re.sub(r"22/122%?", "Без НДС", _para_text(para))
-                        _replace_para_text(para, new_f)
+                        nf = re.sub(r"22/122%?", "Без НДС", _para_text(para))
+                        _set_para(para, nf)
 
-                elif re.search(_AMOUNT_PAT, ct):
+                elif re.search(A_PAT, ct):
                     if j == nds_sum_col and ri > 0:
                         for para in cell.paragraphs:
-                            if re.search(_AMOUNT_PAT, _para_text(para)):
-                                _replace_para_text(para, "0,00")
+                            if re.search(A_PAT, _para_text(para)):
+                                _set_para(para, "0,00")
                     else:
-                        if ri > 0 and (j >= len(row.cells) - 2): 
+                        if ri > 0 and (j >= len(row.cells) - 2):
                             for para in cell.paragraphs:
-                                if re.search(_AMOUNT_PAT, _para_text(para)):
-                                    _replace_para_text(para, amt_str)
+                                if re.search(A_PAT, _para_text(para)):
+                                    _set_para(para, amt_str)
 
     for para in doc.paragraphs:
-        full = _para_text(para)
+        full     = _para_text(para)
         new_full = full
 
-        if re.search(_DATE_PAT, full) and "счет" in full.lower():
-            new_full = re.sub(_DATE_PAT, date, new_full)
+        if re.search(DATE_PAT, full) and "счет" in full.lower():
+            new_full = re.sub(DATE_PAT, date, new_full)
 
-        if re.search(_WORDS_PAT, new_full):
-            new_full = re.sub(_WORDS_PAT, amt_words, new_full)
+        if re.search(W_PAT, new_full):
+            new_full = re.sub(W_PAT, amt_words, new_full)
             new_full = re.sub(r",?\s*в\s+т\.?\s*ч\.?\s*НДС[^.]*", ", без НДС", new_full)
             new_full = re.sub(r"\s{2,}", " ", new_full)
 
         new_full = _remove_nds(new_full)
 
         if new_full != full:
-            _replace_para_text(para, new_full)
+            _set_para(para, new_full)
 
     return doc
 
@@ -399,168 +444,198 @@ def main():
 
     if 'uploaded_files' not in st.session_state:
         st.session_state.uploaded_files = {}
-    
+
     def auto_fill():
         if 'inv1' in st.session_state.uploaded_files:
             try:
-                doc = Document(BytesIO(st.session_state.uploaded_files['inv1']))
+                doc  = Document(BytesIO(st.session_state.uploaded_files['inv1']))
                 data = extract_invoice_data(doc)
-                
                 updates = []
-                if data.get('buyer_name'):
-                    st.session_state.buyer_name = data['buyer_name']
-                    updates.append("ФИО")
-                if data.get('dkp_number'):
-                    st.session_state.dkp_number = data['dkp_number']
-                    updates.append("Номер ДКП")
-                if data.get('date'):
-                    st.session_state.date = data['date']
-                    updates.append("Дата")
-                if data.get('car_brand'):
-                    st.session_state.car_brand = data['car_brand']
-                    updates.append("Марка")
-                if data.get('car_vin'):
-                    st.session_state.car_vin = data['car_vin']
-                    updates.append("VIN")
-                if data.get('car_color'):
-                    st.session_state.car_color = data['car_color']
-                    updates.append("Цвет")
-                if data.get('car_reg'):
-                    st.session_state.car_reg = data['car_reg']
-                    updates.append("Гос.номер")
-                
+                mapping = {
+                    'buyer_name': 'ФИО',
+                    'dkp_number': 'Номер ДКП',
+                    'date':       'Дата',
+                    'car_brand':  'Марка',
+                    'car_vin':    'VIN',
+                    'car_color':  'Цвет',
+                    'car_reg':    'Гос.номер',
+                }
+                for key, label in mapping.items():
+                    if data.get(key):
+                        st.session_state[key] = data[key]
+                        updates.append(label)
                 if updates:
-                    st.success(f"✅ Успешно импортировано: {', '.join(updates)}")
+                    st.success(f"✅ Импортировано: {', '.join(updates)}")
                 else:
                     st.warning("Не удалось извлечь данные. Проверьте формат Счёта №1.")
             except Exception as e:
                 st.error(f"Ошибка парсинга: {e}")
 
+    # ── БОКОВАЯ ПАНЕЛЬ ──────────────────────────────────────
     with st.sidebar:
         st.header("📁 Шаблоны документов")
 
-        dkp_file = st.file_uploader("ДКП (шаблон)", type=['docx'], key='dkp_file')
-        pko_file = st.file_uploader("ПКО (шаблон)", type=['docx'], key='pko_file')
-        inv1_file = st.file_uploader("Счёт №1 (шаблон) ⬅️ авто-заполнение", type=['docx'], key='inv1_file')
-        inv2_file = st.file_uploader("Счёт №2 (шаблон)", type=['docx'], key='inv2_file')
+        dkp_file  = st.file_uploader("ДКП",                            type=['docx'], key='dkp_file')
+        pko_file  = st.file_uploader("ПКО",                            type=['docx'], key='pko_file')
+        inv1_file = st.file_uploader("Счёт №1  ⬅️ авто-заполнение",   type=['docx'], key='inv1_file')
+        inv2_file = st.file_uploader("Счёт №2",                        type=['docx'], key='inv2_file')
 
-        if dkp_file: st.session_state.uploaded_files['dkp'] = dkp_file.getvalue()
-        if pko_file: st.session_state.uploaded_files['pko'] = pko_file.getvalue()
+        if dkp_file:  st.session_state.uploaded_files['dkp']  = dkp_file.getvalue()
+        if pko_file:  st.session_state.uploaded_files['pko']  = pko_file.getvalue()
         if inv1_file: st.session_state.uploaded_files['inv1'] = inv1_file.getvalue()
         if inv2_file: st.session_state.uploaded_files['inv2'] = inv2_file.getvalue()
 
         st.markdown("---")
         st.markdown("### Статус загрузки:")
-        for name, label in [('dkp', 'ДКП'), ('pko', 'ПКО'), ('inv1', 'Счёт №1'), ('inv2', 'Счёт №2')]:
+        for name, label in [('dkp','ДКП'), ('pko','ПКО'),
+                             ('inv1','Счёт №1'), ('inv2','Счёт №2')]:
             if name in st.session_state.uploaded_files:
                 st.success(f"✅ {label} загружен")
             else:
                 st.warning(f"⚠️ {label} не загружен")
 
+    # ── ОСНОВНАЯ ЧАСТЬ ──────────────────────────────────────
     col1, col2 = st.columns(2)
 
     with col1:
         st.header("📋 Данные сделки")
 
-        if 'buyer_name' not in st.session_state: st.session_state.buyer_name = ''
-        if 'dkp_number' not in st.session_state: st.session_state.dkp_number = ''
-        if 'date' not in st.session_state: st.session_state.date = datetime.today().strftime("%d.%m.%Y")
-        if 'car_brand' not in st.session_state: st.session_state.car_brand = ''
-        if 'car_vin' not in st.session_state: st.session_state.car_vin = ''
-        if 'car_color' not in st.session_state: st.session_state.car_color = ''
-        if 'car_reg' not in st.session_state: st.session_state.car_reg = ''
-        if 'real_price' not in st.session_state: st.session_state.real_price = ''
-        if 'pv_amount' not in st.session_state: st.session_state.pv_amount = ''
+        defaults = {
+            'buyer_name': '', 'dkp_number': '',
+            'date': datetime.today().strftime("%d.%m.%Y"),
+            'car_brand': '', 'car_vin': '',
+            'car_color': '', 'car_reg': '',
+            'real_price': '', 'pv_amount': '',
+        }
+        for k, v in defaults.items():
+            if k not in st.session_state:
+                st.session_state[k] = v
 
-        st.text_input("ФИО покупателя", key='buyer_name')
-        st.text_input("Номер ДКП", key='dkp_number')
-        st.text_input("Дата документов", key='date')
-        st.text_input("Марка / Модель", key='car_brand')
-        st.text_input("VIN", key='car_vin')
-        st.text_input("Цвет", key='car_color')
-        st.text_input("Гос. номер", key='car_reg')
+        st.text_input("ФИО покупателя",  key='buyer_name')
+        st.text_input("Номер ДКП",        key='dkp_number')
+        st.text_input("Дата документов",  key='date',
+                      help="Формат: ДД.ММ.ГГГГ")
+        st.text_input("Марка / Модель",   key='car_brand')
+        st.text_input("VIN",              key='car_vin')
+        st.text_input("Цвет",             key='car_color')
+        st.text_input("Гос. номер",       key='car_reg')
 
     with col2:
         st.header("💰 Суммы")
 
-        real_price_str = st.text_input("Реальная цена авто (руб.)", key='real_price')
-        pv_amount_str = st.text_input("Сумма искусственного ПВ (руб.)", key='pv_amount')
+        st.text_input("Реальная цена авто (₽)",      key='real_price',
+                      placeholder="3 250 000")
+        st.text_input("Сумма искусственного ПВ (₽)", key='pv_amount',
+                      placeholder="250 000")
 
-        try:
-            real_price = parse_amount(real_price_str) if real_price_str else 0
-            pv_amount = parse_amount(pv_amount_str) if pv_amount_str else 0
-            if real_price > 0 and pv_amount > 0:
-                total_price = real_price + pv_amount
-                st.info(f"**Цена по документам (ДКП + Счёт №1):** {format_amount(total_price)} руб.")
-                st.info(f"**Счёт №2 (к доплате покупателем):** {format_amount(real_price)} руб.")
-        except:
-            pass
+        real_price = parse_amount(st.session_state.real_price)
+        pv_amount  = parse_amount(st.session_state.pv_amount)
 
-    if 'inv1' in st.session_state.uploaded_files:
-        st.button("🔄 Авто-заполнить из Счёта №1", on_click=auto_fill, use_container_width=True)
+        if real_price > 0 and pv_amount > 0:
+            total = real_price + pv_amount
+            st.success(f"**Цена по документам (ДКП + Счёт №1):**  \n{format_amount(total)} ₽")
+            st.info(f"**Счёт №2 (к доплате покупателем):**  \n{format_amount(real_price)} ₽")
+            st.markdown(f"""
+**Прописью (цена по документам):**  
+_{amount_to_words(total)}_
+
+**Прописью (ПВ):**  
+_{amount_to_words(pv_amount)}_
+""")
+
+        # Авто-заполнение из счёта
+        if 'inv1' in st.session_state.uploaded_files:
+            st.button("🔄 Авто-заполнить из Счёта №1",
+                      on_click=auto_fill, use_container_width=True)
 
     st.markdown("---")
-    if st.button("✅ Сгенерировать документы", type="primary", use_container_width=True):
-        errors = []
-        if not any(k in st.session_state.uploaded_files for k in ['dkp', 'pko', 'inv1', 'inv2']):
-            errors.append("Загрузите все необходимые шаблоны в боковой панели")
-        if not st.session_state.buyer_name.strip():
-            errors.append("Не заполнено ФИО покупателя")
-        
-        real_price = parse_amount(st.session_state.real_price)
-        pv_amount = parse_amount(st.session_state.pv_amount)
-        
-        if real_price <= 0: errors.append("Укажите корректную реальную цену авто")
-        if pv_amount <= 0: errors.append("Укажите корректную сумму ПВ")
 
-        if errors:
-            for error in errors: st.error(error)
-        else:
-            total = real_price + pv_amount
-            params = {
-                "buyer_name": st.session_state.buyer_name.strip(),
-                "dkp_number": st.session_state.dkp_number.strip(),
-                "date": st.session_state.date.strip(),
-                "car_brand": st.session_state.car_brand.strip(),
-                "car_vin": st.session_state.car_vin.strip(),
-                "car_color": st.session_state.car_color.strip(),
-                "car_reg": st.session_state.car_reg.strip(),
-                "real_price": real_price,
-                "pv_amount": pv_amount,
-                "new_price": total,
-            }
+    # ── ГЕНЕРАЦИЯ ───────────────────────────────────────────
+    errors = []
+    missing_files = [lbl for k, lbl in [('dkp','ДКП'),('pko','ПКО'),
+                                         ('inv1','Счёт №1'),('inv2','Счёт №2')]
+                     if k not in st.session_state.uploaded_files]
+    if missing_files:
+        errors.append(f"Не загружены файлы: {', '.join(missing_files)}")
+    if not st.session_state.buyer_name.strip():
+        errors.append("Не заполнено ФИО покупателя")
+    if parse_amount(st.session_state.real_price) <= 0:
+        errors.append("Укажите реальную цену авто")
+    if parse_amount(st.session_state.pv_amount) <= 0:
+        errors.append("Укажите сумму ПВ")
 
-            surname = (st.session_state.buyer_name.strip().split() or ["Клиент"])[0]
-            date_safe = st.session_state.date.replace(".", "-")
+    if errors:
+        for e in errors:
+            st.warning(f"⚠️ {e}")
 
-            tasks = [
-                ("dkp", f"ДКП_{surname}_{date_safe}.docx", process_dkp),
-                ("pko", f"ПКО_{surname}_{date_safe}.docx", process_pko),
-                ("inv1", f"Счёт1_{surname}_{date_safe}.docx", lambda d, p: process_invoice(d, p, p["new_price"])),
-                ("inv2", f"Счёт2_{surname}_{date_safe}.docx", lambda d, p: process_invoice(d, p, p["real_price"])),
-            ]
+    btn = st.button(
+        "✅  Сгенерировать документы",
+        type="primary",
+        use_container_width=True,
+        disabled=bool(errors))
 
-            progress_bar = st.progress(0)
-            generated_files = []
+    if btn:
+        real  = parse_amount(st.session_state.real_price)
+        pv    = parse_amount(st.session_state.pv_amount)
+        total = real + pv
 
-            for i, (key, fname, processor) in enumerate(tasks):
-                if key in st.session_state.uploaded_files:
-                    try:
-                        doc = Document(BytesIO(st.session_state.uploaded_files[key]))
-                        doc = processor(doc, params)
-                        output = BytesIO()
-                        doc.save(output)
-                        generated_files.append((fname, output.getvalue()))
-                    except Exception as e:
-                        st.error(f"Ошибка при обработке {fname}: {e}")
-                progress_bar.progress((i + 1) / len(tasks))
+        params = {
+            "buyer_name": st.session_state.buyer_name.strip(),
+            "dkp_number": st.session_state.dkp_number.strip(),
+            "date":       st.session_state.date.strip(),
+            "car_brand":  st.session_state.car_brand.strip(),
+            "car_vin":    st.session_state.car_vin.strip(),
+            "car_color":  st.session_state.car_color.strip(),
+            "car_reg":    st.session_state.car_reg.strip(),
+            "real_price": real,
+            "pv_amount":  pv,
+            "new_price":  total,
+        }
 
-            progress_bar.empty()
+        surname   = (st.session_state.buyer_name.strip().split() or ["Клиент"])[0]
+        date_safe = st.session_state.date.replace(".", "-")
 
-            if generated_files:
-                st.subheader("📥 Скачать готовые документы:")
-                for fname, data in generated_files:
-                    st.download_button(label=f"Скачать {fname}", data=data, file_name=fname, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        tasks = [
+            ("dkp",  f"ДКП_{surname}_{date_safe}.docx",
+             lambda d, p: process_dkp(d, p)),
+            ("pko",  f"ПКО_{surname}_{date_safe}.docx",
+             lambda d, p: process_pko(d, p)),
+            ("inv1", f"Счёт1_{surname}_{date_safe}.docx",
+             lambda d, p: process_invoice(d, p, p["new_price"])),
+            ("inv2", f"Счёт2_{surname}_{date_safe}.docx",
+             lambda d, p: process_invoice(d, p, p["real_price"])),
+        ]
+
+        progress_bar    = st.progress(0, text="Начинаю обработку...")
+        generated_files = []
+
+        for i, (key, fname, processor) in enumerate(tasks):
+            if key in st.session_state.uploaded_files:
+                try:
+                    progress_bar.progress(i / len(tasks), text=f"Обрабатываю: {fname}")
+                    doc    = Document(BytesIO(st.session_state.uploaded_files[key]))
+                    doc    = processor(doc, params)
+                    output = BytesIO()
+                    doc.save(output)
+                    generated_files.append((fname, output.getvalue()))
+                except Exception as e:
+                    st.error(f"❌ Ошибка при обработке {fname}: {e}")
+            progress_bar.progress((i + 1) / len(tasks))
+
+        progress_bar.empty()
+
+        if generated_files:
+            st.success(f"✅ Сгенерировано {len(generated_files)} документа")
+            st.subheader("📥 Скачать готовые документы:")
+            cols = st.columns(len(generated_files))
+            for col, (fname, data) in zip(cols, generated_files):
+                with col:
+                    st.download_button(
+                        label=f"📄 {fname}",
+                        data=data,
+                        file_name=fname,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True)
 
 if __name__ == "__main__":
     main()
