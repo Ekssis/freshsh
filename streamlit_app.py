@@ -115,42 +115,34 @@ def insert_paragraph_after(paragraph, text, source_para=None):
 
 def extract_invoice_data(doc: Document) -> dict:
     data = {}
-    for para in _iter_all_paragraphs(doc):
-        t = para.text.strip()
-        m = re.search(
-            r"[Пп]родажа\s+[тТ][/\\][сС]\s+№\s*([\w\-/]+).*?от\s+(\d{2}\.\d{2}\.(?:\d{2}|\d{4}))", t)
-        if m and "dkp_number" not in data:
-            data["dkp_number"] = m.group(1).strip()
-            parts = m.group(2).split(".")
-            if len(parts[2]) == 2: parts[2] = "20" + parts[2]
-            data["date"] = ".".join(parts)
-        m = re.search(
-            r"[Пп]окупатель[:\s]+(?:ИНН\s+\d+[,\s]+)?([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)", t)
-        if m and "buyer_name" not in data:
-            data["buyer_name"] = m.group(1).strip()
-        m = re.search(
-            r"([A-ZА-ЯЁ]{2,}(?:\s+[A-ZА-ЯЁ0-9]+)+)\s+([а-яё]+)\s+№\s*([A-ZА-ЯЁ0-9]+)\s+VIN\s+([A-Z0-9]{17})",
-            t, re.IGNORECASE)
-        if m and "car_vin" not in data:
-            data["car_brand"] = m.group(1).strip()
-            data["car_color"] = m.group(2).strip()
-            data["car_reg"]   = m.group(3).strip()
-            data["car_vin"]   = m.group(4).strip()
+    full_text = "\n".join([p.text for p in _iter_all_paragraphs(doc)])
+    
+    # 1. Поиск ДКП и даты
+    m = re.search(r"[Пп]родажа\s+[тТ][/\\][сС]\s+№\s*([\w\-/]+).*?от\s+(\d{2}\.\d{2}\.(?:\d{2}|\d{4}))", full_text)
+    if m:
+        data["dkp_number"] = m.group(1).strip()
+        data["date"] = m.group(2) if len(m.group(2).split('.')[2]) == 4 else m.group(2)
+        
+    # 2. Поиск покупателя
+    m = re.search(r"[Пп]окупатель[:\s]+(?:ИНН\s+\d+[,\s]+)?([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)", full_text)
+    if m: data["buyer_name"] = m.group(1).strip()
+    
+    # 3. Улучшенный парсинг авто (захватываем всё до цвета)
+    # Ищем: Марка Модель [цвет] № [номер] VIN [вин]
+    colors = ["серый", "белый", "черный", "чёрный", "синий", "красный", "серебристый", "золотистый", "коричневый", "зелёный", "зеленый", "бежевый", "жёлтый", "желтый"]
+    color_pattern = "|".join(colors)
+    
+    # Ищем строку с товаром в таблицах
     for tbl in doc.tables:
         for row in tbl.rows:
             rt = " ".join(c.text.strip() for c in row.cells)
-            if "car_vin" not in data:
-                m = re.search(r"VIN\s+([A-Z0-9]{17})", rt)
-                if m: data["car_vin"] = m.group(1)
-            if "car_color" not in data:
-                m = re.search(
-                    r"\b(серый|белый|чёрный|черный|синий|красный|серебристый"
-                    r"|золотистый|коричневый|зелёный|зеленый|бежевый|жёлтый|желтый)\b",
-                    rt, re.IGNORECASE)
-                if m: data["car_color"] = m.group(1).lower()
-            if "car_reg" not in data:
-                m = re.search(r"№\s*([A-ZА-ЯЁ]{1,2}\d{3}[A-ZА-ЯЁ]{2}\d{2,3})", rt, re.IGNORECASE)
-                if m: data["car_reg"] = m.group(1)
+            m = re.search(f"(.*?)\s+({color_pattern})\s+№\s*([A-ZА-ЯЁ0-9]+)\s+VIN\s+([A-Z0-9]{17})", rt, re.IGNORECASE)
+            if m:
+                data["car_brand"] = m.group(1).strip()
+                data["car_color"] = m.group(2).strip()
+                data["car_reg"]   = m.group(3).strip()
+                data["car_vin"]   = m.group(4).strip()
+                break
     return data
 
 # ─────────────────────────────────────────────────────────────
@@ -206,98 +198,48 @@ def process_dkp(doc: Document, p: dict) -> Document:
 # ─────────────────────────────────────────────────────────────
 
 def process_pko(doc: Document, p: dict) -> Document:
-    pv_str     = format_amount(p["pv_amount"])
-    pv_words   = amount_to_words(p["pv_amount"])
-    date       = p["date"]
-    buyer      = p["buyer_name"]
+    pv_str    = format_amount(p["pv_amount"])
+    pv_words  = amount_to_words(p["pv_amount"])
+    date      = p["date"]
+    buyer     = p["buyer_name"]
     
-    osnov1     = f"По ДКП №{p['dkp_number']} от {date}"
-    osnov2     = f"за а/м {p['car_brand']} {p['car_color']} № {p['car_reg']} VIN {p['car_vin']}"
-    osnov_full = f"{osnov1} {osnov2}"
+    osnov_full = f"По ДКП №{p['dkp_number']} от {date} за а/м {p['car_brand']} {p['car_color']} № {p['car_reg']} VIN {p['car_vin']}"
 
-    # Исключения для дат утверждения бланков и служебных слов
-    SKIP_DATES = re.compile(r"18\.08(\.1998|\.98)?")
-    SKIP_WORDS = re.compile(r"0310001|ОКУД|ОКПО|КО-1|ЦБ\d|Главный|Кассир|Получил|подпись|расшифровка", re.IGNORECASE)
-
-    # Итерация ПО ВСЕМ абзацам и ячейкам таблиц
     for para in _iter_all_paragraphs(doc):
-        full = _para_text(para)
-        t    = full.strip()
-        if not t:
+        t = para.text.strip()
+        if not t: continue
+
+        # 1. Замена даты (только если параграф короткий и выглядит как дата)
+        if re.match(r"^\d{2}\.\d{2}\.\d{4}$", t):
+            _set_para(para, date)
+            continue
+            
+        # 2. Принято от
+        if "Принято от" in t:
+            # Оставляем маркер, меняем только имя
+            new_text = re.sub(r"(Принято от[:\s]*).*?($)", rf"\g<1>{buyer}", t)
+            _set_para(para, new_text)
             continue
 
-        nf = full
-
-        # --- 1. Точные замены формата (сохраняем табуляции для отступов) ---
-        if re.match(r"^от\s+\d{2}\.\d{2}\.\d{4}$", t):
-            _set_para(para, f"от {date}")
-            continue
-
-        if t.startswith("подразделение") and "\t" in full:
-            _set_para(para, full[: full.index("\t") + 1] + buyer)
-            continue
-
-        if t.startswith("Принято от") and "\t" in full:
-            left_part = full[:full.index("\t")]
-            new_left = re.sub(r"(Принято от\s*[:]?\s*).*", rf"\g<1>{buyer}", left_part)
-            if "Принято от" in new_left and buyer not in new_left: 
-                new_left = f"Принято от: {buyer}"
-            _set_para(para, f"{new_left}\t{pv_words}")
-            continue
-
-        if re.match(r"^Принято от\s*[:]?\s*[А-ЯЁ]", t):
-            nf = re.sub(r"(Принято от\s*[:]?\s*).*?($)", rf"\g<1>{buyer}", nf)
-            _set_para(para, nf)
-            continue
-
-        # --- 2. Основание (разбитое на 2 строки или целиком) ---
-        if re.match(r"^По ДКП №", t) and "за а/м" in t:
+        # 3. Основание
+        if "По ДКП" in t or "за а/м" in t:
             _set_para(para, osnov_full)
             continue
-        if re.match(r"^По ДКП №", t):
-            _set_para(para, osnov1)
+
+        # 4. Замена суммы (ТОЛЬКО там, где есть слово "Сумма")
+        if "Сумма" in t and RE_AMOUNT.search(t):
+            # Заменяем только цифры, игнорируя слова
+            new_text = RE_AMOUNT.sub(pv_str, t)
+            # Если есть пропись суммы, меняем её
+            if RE_WORDS.search(new_text):
+                new_text = RE_WORDS.sub(pv_words, new_text)
+            _set_para(para, new_text)
             continue
-        if t.startswith("за а/м "):
-            _set_para(para, osnov2)
-            continue
-
-        if re.match(r"^Сумма", t) and RE_AMOUNT.search(t):
-            _set_para(para, RE_AMOUNT.sub(pv_str, full))
-            continue
-
-        # --- 3. Универсальные замены (сработают в любой ячейке таблицы) ---
-        
-        # Замена голых дат
-        if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", nf.strip()) and not SKIP_DATES.search(nf):
-            nf = nf.replace(nf.strip(), date)
-
-        # Замена сумм цифрами
-        if RE_AMOUNT.search(nf) and not SKIP_WORDS.search(t):
-            nf = RE_AMOUNT.sub(pv_str, nf)
-        
-        # Замена сумм прописью
-        if RE_WORDS.search(nf) and not SKIP_WORDS.search(t):
-            nf = RE_WORDS.sub(pv_words, nf)
-
-        # Вычищаем НДС ВЕЗДЕ (как указано на скриншотах)
-        if "НДС" in nf or "22/122" in nf or "В том числе" in nf:
-            # Если это строка вида "В том числе: НДС...\tМ.П." (чтобы не удалить печать)
-            if t.startswith("В том числе") and "НДС" in t and "\t" in full:
-                nf = "\t" + full[full.index("\t") + 1:]
-            else:
-                # Универсальная очистка через RegEx (удаляет блок про НДС, но оставляет остальной текст)
-                nf = re.sub(r"В\s+том\s+числе[:\s]*НДС.*?(?=\t|$)", "", nf, flags=re.IGNORECASE)
-                nf = re.sub(r",?\s*в\s+т\.?\s*ч\.?\s*НДС[^.;\n\t]*", "", nf, flags=re.IGNORECASE)
-                nf = re.sub(r"\(?22/122%?\)?\s*[\d\s,.]+руб\.?", "", nf, flags=re.IGNORECASE)
-                nf = re.sub(r"НДС\s*[\d\s,.]+руб\.?", "", nf, flags=re.IGNORECASE)
-                
-                # Если после удаления остался пустой "хвост"
-                if nf.strip() in ("В том числе", "В том числе:"):
-                    nf = ""
-
-        if nf != full:
-            _set_para(para, nf.strip("\n"))
-
+            
+        # 5. Очистка НДС (точечно)
+        if "НДС" in t or "22/122" in t:
+            _set_para(para, "") # Просто удаляем строку с НДС, если она встречается отдельно
+            
     return doc
 
 # ─────────────────────────────────────────────────────────────
