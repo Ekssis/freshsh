@@ -210,88 +210,94 @@ def process_pko(doc: Document, p: dict) -> Document:
     pv_words   = amount_to_words(p["pv_amount"])
     date       = p["date"]
     buyer      = p["buyer_name"]
+    
     osnov1     = f"По ДКП №{p['dkp_number']} от {date}"
     osnov2     = f"за а/м {p['car_brand']} {p['car_color']} № {p['car_reg']} VIN {p['car_vin']}"
     osnov_full = f"{osnov1} {osnov2}"
 
-    for para in doc.paragraphs:
+    # Исключения для дат утверждения бланков и служебных слов
+    SKIP_DATES = re.compile(r"18\.08(\.1998|\.98)?")
+    SKIP_WORDS = re.compile(r"0310001|ОКУД|ОКПО|КО-1|ЦБ\d|Главный|Кассир|Получил|подпись|расшифровка", re.IGNORECASE)
+
+    # Итерация ПО ВСЕМ абзацам и ячейкам таблиц
+    for para in _iter_all_paragraphs(doc):
         full = _para_text(para)
         t    = full.strip()
         if not t:
             continue
 
-        # ── "от ДД.ММ.ГГГГ" → новая дата ──────────────────────
+        nf = full
+
+        # --- 1. Точные замены формата (сохраняем табуляции для отступов) ---
         if re.match(r"^от\s+\d{2}\.\d{2}\.\d{4}$", t):
             _set_para(para, f"от {date}")
             continue
 
-        # ── "подразделение\tФИО" → новое ФИО ──────────────────
         if t.startswith("подразделение") and "\t" in full:
             _set_para(para, full[: full.index("\t") + 1] + buyer)
             continue
 
-        # ── "По ДКП №... за а/м..." (одна строка) ─────────────
+        if t.startswith("Принято от") and "\t" in full:
+            left_part = full[:full.index("\t")]
+            new_left = re.sub(r"(Принято от\s*[:]?\s*).*", rf"\g<1>{buyer}", left_part)
+            if "Принято от" in new_left and buyer not in new_left: 
+                new_left = f"Принято от: {buyer}"
+            _set_para(para, f"{new_left}\t{pv_words}")
+            continue
+
+        if re.match(r"^Принято от\s*[:]?\s*[А-ЯЁ]", t):
+            nf = re.sub(r"(Принято от\s*[:]?\s*).*?($)", rf"\g<1>{buyer}", nf)
+            _set_para(para, nf)
+            continue
+
+        # --- 2. Основание (разбитое на 2 строки или целиком) ---
         if re.match(r"^По ДКП №", t) and "за а/м" in t:
             _set_para(para, osnov_full)
             continue
-
-        # ── "По ДКП №..." без "за а/м" (строка 1 основания) ───
         if re.match(r"^По ДКП №", t):
             _set_para(para, osnov1)
             continue
-
-        # ── "за а/м ..." (строка 2 основания) ─────────────────
         if t.startswith("за а/м "):
             _set_para(para, osnov2)
             continue
 
-        # ── "Сумма\t428 000,00" — цифрами ─────────────────────
         if re.match(r"^Сумма", t) and RE_AMOUNT.search(t):
             _set_para(para, RE_AMOUNT.sub(pv_str, full))
             continue
 
-        # ── "Принято от: ФИО\tпрописью" ───────────────────────
-        if t.startswith("Принято от:") and "\t" in full:
-            _set_para(para, f"Принято от: {buyer}\t{pv_words}")
-            continue
+        # --- 3. Универсальные замены (сработают в любой ячейке таблицы) ---
+        
+        # Замена голых дат
+        if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", nf.strip()) and not SKIP_DATES.search(nf):
+            nf = nf.replace(nf.strip(), date)
 
-        # ── Только прописью (в квитанции) ─────────────────────
-        if RE_WORDS.match(t) and not re.search(r"Принято|Основание|Сумма", t):
-            _set_para(para, pv_words)
-            continue
+        # Замена сумм цифрами
+        if RE_AMOUNT.search(nf) and not SKIP_WORDS.search(t):
+            nf = RE_AMOUNT.sub(pv_str, nf)
+        
+        # Замена сумм прописью
+        if RE_WORDS.search(nf) and not SKIP_WORDS.search(t):
+            nf = RE_WORDS.sub(pv_words, nf)
 
-        # ── НДС строки — убираем ──────────────────────────────
-        if t in ("В том числе", "В том числе:"):
-            _set_para(para, "")
-            continue
+        # Вычищаем НДС ВЕЗДЕ (как указано на скриншотах)
+        if "НДС" in nf or "22/122" in nf or "В том числе" in nf:
+            # Если это строка вида "В том числе: НДС...\tМ.П." (чтобы не удалить печать)
+            if t.startswith("В том числе") and "НДС" in t and "\t" in full:
+                nf = "\t" + full[full.index("\t") + 1:]
+            else:
+                # Универсальная очистка через RegEx (удаляет блок про НДС, но оставляет остальной текст)
+                nf = re.sub(r"В\s+том\s+числе[:\s]*НДС.*?(?=\t|$)", "", nf, flags=re.IGNORECASE)
+                nf = re.sub(r",?\s*в\s+т\.?\s*ч\.?\s*НДС[^.;\n\t]*", "", nf, flags=re.IGNORECASE)
+                nf = re.sub(r"\(?22/122%?\)?\s*[\d\s,.]+руб\.?", "", nf, flags=re.IGNORECASE)
+                nf = re.sub(r"НДС\s*[\d\s,.]+руб\.?", "", nf, flags=re.IGNORECASE)
+                
+                # Если после удаления остался пустой "хвост"
+                if nf.strip() in ("В том числе", "В том числе:"):
+                    nf = ""
 
-        if re.match(r"НДС\s*\(22/122\)", t):
-            _set_para(para, "")
-            continue
+        if nf != full:
+            _set_para(para, nf.strip("\n"))
 
-        # ── "В том числе: НДС...\tМ.П." — оставляем М.П. ─────
-        if t.startswith("В том числе") and "НДС" in t and "\t" in full:
-            _set_para(para, "\t" + full[full.index("\t") + 1:])
-            continue
-
-        # ── Голая дата ─────────────────────────────────────────
-        if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", t):
-            _set_para(para, date)
-            continue
-
-    # Таблицы (дата + ФИО + сумма цифрами)
-    SKIP = re.compile(r"18\.08|0310001|ОКУД|ОКПО|КО-1|ЦБ\d|Главный|Кассир|Получил|подпись|расшифровка")
-    for tbl in doc.tables:
-        for row in tbl.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
-                    ct = para.text.strip()
-                    if not ct or SKIP.search(ct):
-                        continue
-                    if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", ct):
-                        _set_para(para, date)
-                    elif RE_AMOUNT.fullmatch(ct.replace(" ", "").replace("\xa0", "")):
-                        _set_para(para, pv_str)
     return doc
 
 # ─────────────────────────────────────────────────────────────
