@@ -1,6 +1,7 @@
 """
 FRESH - Генератор документов с искусственным ПВ
-v5 FINAL — process_pko переписан с нуля, без escape-багов
+v6 FINAL — исправлены: даты/суммы, сохранение таблицы ном.док,
+           перенос ФИО, парсинг марки авто
 """
 
 import streamlit as st
@@ -57,10 +58,20 @@ def parse_amount(text: str) -> float:
 # DOCX УТИЛИТЫ
 # ─────────────────────────────────────────────────────────────
 
-# Паттерны (одно место — без дублирования)
-RE_DATE   = re.compile(r"\b\d{2}\.\d{2}\.\d{4}\b")
-RE_AMOUNT = re.compile(r"\b\d[\d\s]{0,12}[,.]\d{2}\b")
-RE_WORDS  = re.compile(
+RE_DATE = re.compile(r"\b\d{2}\.\d{2}\.\d{4}\b")
+
+# ── ИСПРАВЛЕНИЕ #1: RE_AMOUNT больше не матчит даты ──
+# Добавлен negative lookahead (?!\.\d{2}) — блокирует совпадение
+# с датами формата DD.MM.YYYY (где после DD.MM идёт .YYYY)
+RE_AMOUNT = re.compile(
+    r"(?<!\d)"                              # не после цифры
+    r"(\d{1,3}(?:[ \u00A0]\d{3})*"          # целая часть с разделителями тысяч
+    r"[.,]\d{2})"                           # десятичная часть (,XX или .XX)
+    r"(?!\.\d{2})"                          # НЕ дата: после суммы нет .XX
+    r"(?!\d)"                               # не перед цифрой
+)
+
+RE_WORDS = re.compile(
     r"[А-ЯЁа-яё][а-яёА-ЯЁ\s\-\,]+"
     r"(?:тысяч|миллион|миллиард|рубл)[а-яё\s\-\,]*"
     r"\d{2}\s+копеек\s*"
@@ -71,6 +82,7 @@ def _para_text(para) -> str:
 
 def _set_para(para, text: str):
     """Пишет text в параграф, очищая все runs кроме первого."""
+    if para is None: return
     if para.runs:
         para.runs[0].text = text
         for r in para.runs[1:]:
@@ -84,7 +96,6 @@ def _remove_nds(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 def _iter_all_paragraphs(doc):
-    """Все параграфы: тело + таблицы + колонтитулы."""
     yield from doc.paragraphs
     for tbl in doc.tables:
         for row in tbl.rows:
@@ -109,6 +120,48 @@ def insert_paragraph_after(paragraph, text, source_para=None):
     new_para.paragraph_format.line_spacing = 1.0
     return new_para
 
+# ── ИСПРАВЛЕНИЕ #3: Расширение ячейки и отключение переноса ──
+def expand_cell_no_wrap(cell, width_twips=9000):
+    """Расширяет ячейку таблицы и отключает перенос слов."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+
+    # Удаляем старую ширину
+    for elem in tcPr.findall(qn('w:tcW')):
+        tcPr.remove(elem)
+    # Ставим новую
+    tcW = OxmlElement('w:tcW')
+    tcW.set(qn('w:w'), str(width_twips))
+    tcW.set(qn('w:type'), 'dxa')
+    tcPr.append(tcW)
+
+    # Удаляем старый noWrap
+    for elem in tcPr.findall(qn('w:noWrap')):
+        tcPr.remove(elem)
+    # Добавляем noWrap — текст не переносится
+    noWrap = OxmlElement('w:noWrap')
+    tcPr.append(noWrap)
+
+    # Также убираем фиксированную ширину у параграфов
+    for para in cell.paragraphs:
+        pPr = para._p.get_or_add_pPr()
+        # Убираем переносы
+        for elem in pPr.findall(qn('w:kinsoku')):
+            pPr.remove(elem)
+
+def set_table_autofit(tbl):
+    """Переключает таблицу в autofit-режим."""
+    tbl_el = tbl._tbl
+    tblPr = tbl_el.tblPr
+    if tblPr is None:
+        tblPr = OxmlElement('w:tblPr')
+        tbl_el.insert(0, tblPr)
+    for elem in tblPr.findall(qn('w:tblLayout')):
+        tblPr.remove(elem)
+    layout = OxmlElement('w:tblLayout')
+    layout.set(qn('w:type'), 'autofit')
+    tblPr.append(layout)
+
 # ─────────────────────────────────────────────────────────────
 # ПАРСИНГ СЧЁТА №1
 # ─────────────────────────────────────────────────────────────
@@ -116,32 +169,76 @@ def insert_paragraph_after(paragraph, text, source_para=None):
 def extract_invoice_data(doc: Document) -> dict:
     data = {}
     full_text = "\n".join([p.text for p in _iter_all_paragraphs(doc)])
-    
+
     # 1. Поиск ДКП и даты
-    m = re.search(r"[Пп]родажа\s+[тТ][/\\][сС]\s+№\s*([\w\-/]+).*?от\s+(\d{2}\.\d{2}\.(?:\d{2}|\d{4}))", full_text)
+    m = re.search(
+        r"[Пп]родажа\s+[тТ][/\\][сС]\s+№\s*([\w\-/]+).*?от\s+(\d{2}\.\d{2}\.(?:\d{2}|\d{4}))",
+        full_text
+    )
     if m:
         data["dkp_number"] = m.group(1).strip()
-        data["date"] = m.group(2) if len(m.group(2).split('.')[2]) == 4 else m.group(2)
-        
+        data["date"] = m.group(2)
+
     # 2. Поиск покупателя
-    m = re.search(r"[Пп]окупатель[:\s]+(?:ИНН\s+\d+[,\s]+)?([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)", full_text)
+    m = re.search(
+        r"[Пп]окупатель[:\s]+(?:ИНН\s+\d+[,\s]+)?([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)",
+        full_text
+    )
     if m: data["buyer_name"] = m.group(1).strip()
-    
-    # 3. Улучшенный парсинг авто (захватываем всё до цвета)
-    # Ищем: Марка Модель [цвет] № [номер] VIN [вин]
-    colors = ["серый", "белый", "черный", "чёрный", "синий", "красный", "серебристый", "золотистый", "коричневый", "зелёный", "зеленый", "бежевый", "жёлтый", "желтый"]
+
+    # ── ИСПРАВЛЕНИЕ #4: Улучшенный парсинг марки и модели авто ──
+    colors = [
+        "серый", "белый", "черный", "чёрный", "синий", "красный",
+        "серебристый", "золотистый", "коричневый", "зелёный", "зеленый",
+        "бежевый", "жёлтый", "желтый"
+    ]
     color_pattern = "|".join(colors)
-    
-    # Ищем строку с товаром в таблицах
+
     for tbl in doc.tables:
         for row in tbl.rows:
-            rt = " ".join(c.text.strip() for c in row.cells)
-            m = re.search(f"(.*?)\s+({color_pattern})\s+№\s*([A-ZА-ЯЁ0-9]+)\s+VIN\s+([A-Z0-9]{17})", rt, re.IGNORECASE)
-            if m:
-                data["car_brand"] = m.group(1).strip()
-                data["car_color"] = m.group(2).strip()
-                data["car_reg"]   = m.group(3).strip()
-                data["car_vin"]   = m.group(4).strip()
+            cells_text = [c.text.strip() for c in row.cells]
+            rt = " ".join(c for c in cells_text if c)
+            if not rt:
+                continue
+
+            # Сначала ищем VIN (17 символов, без I, O, Q)
+            vin_match = re.search(r"\b([A-HJ-NPR-Z0-9]{17})\b", rt, re.IGNORECASE)
+            if not vin_match:
+                continue
+            vin = vin_match.group(1).upper()
+
+            # Ищем цвет
+            color_match = re.search(f"({color_pattern})", rt, re.IGNORECASE)
+            if not color_match:
+                continue
+            color = color_match.group(1).strip()
+
+            # Ищем гос. номер: буква-3цифры-2буквы-регион(2-3 цифры)
+            reg_match = re.search(
+                r"([АВЕКМНОРСТУХABEKMHOPCTYX]\d{3}[АВЕКМНОРСТУХABEKMHOPCTYX]{2}\s*\d{2,3})",
+                rt, re.IGNORECASE
+            )
+            if not reg_match:
+                # Запасной вариант: № <буквенно-цифровой>
+                reg_match = re.search(r"№\s*([A-ZА-ЯЁ0-9]+)", rt, re.IGNORECASE)
+            reg = reg_match.group(1).strip() if reg_match else ""
+
+            # Марка = весь текст ДО цвета, очищенный от мусора
+            brand = rt[:color_match.start()].strip()
+            # Убираем ведущие номера строк, пунктуацию
+            brand = re.sub(r"^[\d№\s\.\,\;\-]+", "", brand).strip()
+            # Убираем возможные заголовки колонок
+            brand = re.sub(
+                r"^(Товар|Наименование|Наименование\s+товара|Услуга)\s*",
+                "", brand, flags=re.IGNORECASE
+            ).strip()
+            brand = brand.rstrip(",.").strip()
+
+            if brand:
+                data["car_brand"] = brand
+                data["car_color"] = color
+                data["car_reg"]   = reg
+                data["car_vin"]   = vin
                 break
     return data
 
@@ -194,52 +291,191 @@ def process_dkp(doc: Document, p: dict) -> Document:
     return doc
 
 # ─────────────────────────────────────────────────────────────
-# ПРОЦЕССОР ПКО  (v5 — точечные замены, скомпилированные regex)
+# ПРОЦЕССОР ПКО  (v6 — даты и суммы разделены, таблица ном. сохранена)
 # ─────────────────────────────────────────────────────────────
 
 def process_pko(doc: Document, p: dict) -> Document:
-    pv_str    = format_amount(p["pv_amount"])
-    pv_words  = amount_to_words(p["pv_amount"])
-    date      = p["date"]
-    buyer     = p["buyer_name"]
-    
-    osnov_full = f"По ДКП №{p['dkp_number']} от {date} за а/м {p['car_brand']} {p['car_color']} № {p['car_reg']} VIN {p['car_vin']}"
+    pv_str   = format_amount(p["pv_amount"])
+    pv_words = amount_to_words(p["pv_amount"])
+    date     = p["date"]
+    buyer    = p["buyer_name"]
 
-    for para in _iter_all_paragraphs(doc):
+    osnov_full = (f"По ДКП №{p['dkp_number']} от {date} "
+                  f"за а/м {p['car_brand']} {p['car_color']} "
+                  f"№ {p['car_reg']} VIN {p['car_vin']}")
+
+    # ── ШАГ 1: Обработка таблиц ──────────────────────────
+    for tbl in doc.tables:
+        # Находим колонку "Сумма" по заголовку
+        sum_col = -1
+        if tbl.rows:
+            for ci, hc in enumerate(tbl.rows[0].cells):
+                ht = hc.text.strip().lower().rstrip(",")
+                if ht == "сумма":
+                    sum_col = ci
+                    break
+
+        for ri, row in enumerate(tbl.rows):
+            for ci, cell in enumerate(row.cells):
+                ct = cell.text.strip()
+                if not ct:
+                    continue
+                ctl = ct.lower()
+
+                # ── ИСПРАВЛЕНИЕ #2: Сохраняем блок "Номер документа" / "Дата составления" ──
+                if "номер документа" in ctl or "дата составления" in ctl:
+                    # Только обновляем дату внутри, остальное не трогаем
+                    for para in cell.paragraphs:
+                        pt = _para_text(para)
+                        if RE_DATE.search(pt):
+                            _set_para(para, RE_DATE.sub(date, pt))
+                    continue
+
+                # ── ИСПРАВЛЕНИЕ #3: "Принято от" — расширяем ячейку, отключаем перенос ──
+                if "принято от" in ctl:
+                    for para in cell.paragraphs:
+                        pt = _para_text(para)
+                        if "принято от" in pt.lower():
+                            new_text = re.sub(
+                                r"(Принято от[:\s]*).*",
+                                rf"\g<1>{buyer}",
+                                pt,
+                                flags=re.IGNORECASE
+                            )
+                            _set_para(para, new_text)
+                    # Расширяем ячейку и отключаем перенос слов
+                    expand_cell_no_wrap(cell, width_twips=9000)
+                    set_table_autofit(tbl)
+                    continue
+
+                # ── "Основание" / "По ДКП" ──
+                if "по дкп" in ctl or "за а/м" in ctl or "основание" in ctl:
+                    first_set = False
+                    for para in cell.paragraphs:
+                        pt = _para_text(para)
+                        if pt.strip() and not first_set:
+                            _set_para(para, osnov_full)
+                            first_set = True
+                        elif first_set:
+                            _set_para(para, "")
+                    continue
+
+                # ── "Сумма прописью" ──
+                if "сумма прописью" in ctl or "прописью" in ctl:
+                    for para in cell.paragraphs:
+                        pt = _para_text(para)
+                        if RE_WORDS.search(pt):
+                            _set_para(para, pv_words)
+                        elif RE_AMOUNT.search(pt):
+                            _set_para(para, pv_str)
+                    continue
+
+                # ── Колонка "Сумма" (по заголовку) — только цифры ──
+                if ci == sum_col and ri > 0:
+                    for para in cell.paragraphs:
+                        pt = _para_text(para)
+                        if RE_AMOUNT.search(pt):
+                            _set_para(para, RE_AMOUNT.sub(pv_str, pt))
+                    continue
+
+                # ── Ячейка с "Сумма" и числом (не заголовок колонки) ──
+                if "сумма" in ctl and RE_AMOUNT.search(ct):
+                    for para in cell.paragraphs:
+                        pt = _para_text(para)
+                        if RE_AMOUNT.search(pt):
+                            new_text = RE_AMOUNT.sub(pv_str, pt)
+                            if RE_WORDS.search(new_text):
+                                new_text = RE_WORDS.sub(pv_words, new_text)
+                            _set_para(para, new_text)
+                    continue
+
+                # ── Дата в отдельной ячейке (только дата) ──
+                if re.match(r"^\d{2}\.\d{2}\.\d{4}$", ct):
+                    if cell.paragraphs:
+                        _set_para(cell.paragraphs[0], date)
+                    continue
+
+                # ── Очистка НДС (точечно, НЕ удаляя ячейку целиком) ──
+                if ("ндс" in ctl or "22/122" in ctl):
+                    # Не трогаем ячейки с "номер" или "дата"
+                    if "номер" in ctl or "дата" in ctl:
+                        continue
+                    for para in cell.paragraphs:
+                        pt = _para_text(para)
+                        cleaned = _remove_nds(pt)
+                        if cleaned != pt:
+                            _set_para(para, cleaned)
+
+    # ── ШАГ 2: Обработка параграфов вне таблиц ──────────
+    for para in doc.paragraphs:
         t = para.text.strip()
-        if not t: continue
+        if not t:
+            continue
+        tl = t.lower()
 
-        # 1. Замена даты (только если параграф короткий и выглядит как дата)
+        # ── ИСПРАВЛЕНИЕ #2: Сохраняем "Номер документа" / "Дата составления" ──
+        if "номер документа" in tl or "дата составления" in tl:
+            if RE_DATE.search(t):
+                _set_para(para, RE_DATE.sub(date, t))
+            continue
+
+        # Дата в чистом виде
         if re.match(r"^\d{2}\.\d{2}\.\d{4}$", t):
             _set_para(para, date)
             continue
-            
-        # 2. Принято от
-        if "Принято от" in t:
-            # Оставляем маркер, меняем только имя
-            new_text = re.sub(r"(Принято от[:\s]*).*?($)", rf"\g<1>{buyer}", t)
+
+        # "Принято от"
+        if "принято от" in tl:
+            new_text = re.sub(
+                r"(Принято от[:\s]*).*",
+                rf"\g<1>{buyer}",
+                t,
+                flags=re.IGNORECASE
+            )
             _set_para(para, new_text)
             continue
 
-        # 3. Основание
-        if "По ДКП" in t or "за а/м" in t:
+        # "По ДКП" / "Основание"
+        if "по дкп" in tl or "за а/м" in tl:
             _set_para(para, osnov_full)
             continue
 
-        # 4. Замена суммы (ТОЛЬКО там, где есть слово "Сумма")
-        if "Сумма" in t and RE_AMOUNT.search(t):
-            # Заменяем только цифры, игнорируя слова
+        # "Сумма прописью"
+        if "сумма прописью" in tl or "прописью" in tl:
+            if RE_WORDS.search(t):
+                _set_para(para, pv_words)
+            elif RE_AMOUNT.search(t):
+                _set_para(para, pv_str)
+            continue
+
+        # "Сумма" с числом — заменяем ТОЛЬКО сумму, даты не трогаем
+        if "сумма" in tl and RE_AMOUNT.search(t):
             new_text = RE_AMOUNT.sub(pv_str, t)
-            # Если есть пропись суммы, меняем её
             if RE_WORDS.search(new_text):
                 new_text = RE_WORDS.sub(pv_words, new_text)
             _set_para(para, new_text)
             continue
-            
-        # 5. Очистка НДС (точечно)
-        if "НДС" in t or "22/122" in t:
-            _set_para(para, "") # Просто удаляем строку с НДС, если она встречается отдельно
-            
+
+        # НДС — точечная очистка, не удаление
+        if "ндс" in tl or "22/122" in tl:
+            if "номер" in tl or "дата" in tl:
+                continue
+            cleaned = _remove_nds(t)
+            if cleaned != t:
+                _set_para(para, cleaned)
+            continue
+
+    # ── ШАГ 3: Колонтитулы — только даты ────────────────
+    for sec in doc.sections:
+        for hf in (sec.header, sec.footer):
+            if hf:
+                for para in hf.paragraphs:
+                    t = para.text.strip()
+                    if not t:
+                        continue
+                    if RE_DATE.search(t):
+                        _set_para(para, RE_DATE.sub(date, t))
+
     return doc
 
 # ─────────────────────────────────────────────────────────────
@@ -252,7 +488,6 @@ def process_invoice(doc: Document, p: dict, amount: float) -> Document:
     date      = p["date"]
 
     for tbl in doc.tables:
-        # Находим колонку "Сумма НДС" по заголовку
         nds_sum_col = -1
         if tbl.rows:
             for ci, hc in enumerate(tbl.rows[0].cells):
@@ -262,6 +497,17 @@ def process_invoice(doc: Document, p: dict, amount: float) -> Document:
         for ri, row in enumerate(tbl.rows):
             for j, cell in enumerate(row.cells):
                 ct = cell.text.strip()
+                if not ct:
+                    continue
+
+                # ── ИСПРАВЛЕНИЕ #2: Сохраняем "Номер документа" / "Дата составления" ──
+                if "номер документа" in ct.lower() or "дата составления" in ct.lower():
+                    for para in cell.paragraphs:
+                        pt = _para_text(para)
+                        if RE_DATE.search(pt):
+                            _set_para(para, RE_DATE.sub(date, pt))
+                    continue
+
                 if re.search(r"22/122", ct):
                     for para in cell.paragraphs:
                         nf = re.sub(r"22/122%?", "Без НДС", _para_text(para))
@@ -280,6 +526,15 @@ def process_invoice(doc: Document, p: dict, amount: float) -> Document:
     for para in doc.paragraphs:
         full = _para_text(para)
         nf   = full
+
+        # Сохраняем "Номер документа" / "Дата составления"
+        if "номер документа" in full.lower() or "дата составления" in full.lower():
+            if RE_DATE.search(full):
+                nf = RE_DATE.sub(date, full)
+            if nf != full:
+                _set_para(para, nf)
+            continue
+
         if RE_DATE.search(full) and "счет" in full.lower():
             nf = RE_DATE.sub(date, nf)
         if RE_WORDS.search(nf):
@@ -326,7 +581,6 @@ def main():
             except Exception as e:
                 st.error(f"Ошибка: {e}")
 
-    # ── Боковая панель ───────────────────────────────────────
     with st.sidebar:
         st.header("📁 Шаблоны документов")
         dkp_f  = st.file_uploader("ДКП",                           type=["docx"])
@@ -347,7 +601,6 @@ def main():
             else:
                 st.warning(f"⚠️ {lbl} не загружен")
 
-    # ── Основная область ────────────────────────────────────
     col1, col2 = st.columns(2)
 
     defaults = {
@@ -391,7 +644,6 @@ def main():
 
     st.markdown("---")
 
-    # ── Валидация и кнопка ──────────────────────────────────
     missing = []
     for k, lbl in [("dkp","ДКП"),("pko","ПКО"),("inv1","Счёт №1"),("inv2","Счёт №2")]:
         if k not in st.session_state.uploaded_files:
